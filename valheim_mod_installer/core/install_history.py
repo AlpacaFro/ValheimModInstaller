@@ -59,6 +59,26 @@ def save_installed_files(
     return path
 
 
+def load_install_history(bepinex_dir: Path) -> dict:
+    return load_history(history_path(bepinex_dir))
+
+
+def write_install_history(bepinex_dir: Path, data: dict) -> Path:
+    path = history_path(bepinex_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    data["app"] = APP_NAME
+    data["game"] = GAME_NAME
+    data["last_updated"] = datetime.now().isoformat(timespec="seconds")
+    if not isinstance(data.get("mods"), dict):
+        data["mods"] = {}
+
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+
+    return path
+
+
 def load_history(path: Path) -> dict:
     if not path.exists():
         return {"app": APP_NAME, "game": GAME_NAME, "last_updated": "", "mods": {}}

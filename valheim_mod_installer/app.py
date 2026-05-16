@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox
 
 from .core.dependencies import detect_missing_dependencies, loose_match_key
 from .core.downloader import CHUNK_SIZE, REQUEST_TIMEOUT
-from .core.install_history import save_installed_files
+from .core.install_history import load_install_history, save_installed_files, write_install_history
 from .core.thunderstore import UnsupportedURL, parse_thunderstore_package_url, resolve_download_url
 from .models.mod import INITIAL_MODS
 from .utils.files import guess_download_filename, sanitize_filename
@@ -164,12 +164,22 @@ class ValheimModDownloader(ctk.CTk):
         )
         self.main_action_button.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
 
+        self.uninstall_button = ctk.CTkButton(
+            footer,
+            text="Uninstall Selected Mods",
+            height=38,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            command=self.uninstall_selected_mods,
+        )
+        self.uninstall_button.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+
         self.progress = ctk.CTkProgressBar(footer)
-        self.progress.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.progress.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.progress.set(0)
 
         self.status_label = ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.status_label.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 14))
 
     def _render_mods(self) -> None:
         for child in self.mod_frame.winfo_children():
@@ -224,6 +234,8 @@ class ValheimModDownloader(ctk.CTk):
             "Extracting": "#facc15",
             "Installing": "#fb923c",
             "Installed": "#4ade80",
+            "Uninstalling": "#fb923c",
+            "Uninstalled": "#4ade80",
             "Failed": "#f87171",
             "Disabled": "#6b7280",
         }
@@ -237,6 +249,7 @@ class ValheimModDownloader(ctk.CTk):
             self.export_button,
             self.import_button,
             self.main_action_button,
+            self.uninstall_button,
             self.select_bepinex_button,
             self.install_mode_selector,
         ):
@@ -435,6 +448,150 @@ class ValheimModDownloader(ctk.CTk):
             daemon=True,
         )
         worker.start()
+
+    def uninstall_selected_mods(self) -> None:
+        if self.is_busy:
+            return
+
+        bepinex_dir = self.selected_bepinex_path
+        if bepinex_dir is None:
+            messagebox.showerror("BepInEx Folder Required", "Select a valid BepInEx folder before uninstalling mods.")
+            self._queue_log("Uninstall blocked because no valid BepInEx folder is selected")
+            return
+
+        selected_mods = [(index, mod.copy()) for index, mod in enumerate(self.mods) if mod.get("enabled", True)]
+        if not selected_mods:
+            messagebox.showinfo("No Enabled Mods", "No enabled mods selected.")
+            self._queue_log("Uninstall blocked because no enabled mods are selected")
+            return
+
+        self._set_busy(True)
+        self.progress.set(0)
+        self.status_var.set("Starting uninstall...")
+        for mod in self.mods:
+            mod["status"] = "Ready" if mod.get("enabled", True) else "Disabled"
+        self._render_mods()
+        self._queue_log(f"Starting uninstall for {len(selected_mods)} selected mods")
+
+        worker = threading.Thread(
+            target=self._uninstall_worker,
+            args=(selected_mods, bepinex_dir),
+            daemon=True,
+        )
+        worker.start()
+
+    def _uninstall_worker(self, selected_mods: List[Tuple[int, dict]], bepinex_dir: Path) -> None:
+        history = load_install_history(bepinex_dir)
+        history_mods = history.get("mods", {})
+        if not isinstance(history_mods, dict):
+            history_mods = {}
+            history["mods"] = history_mods
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_uninstall")
+        backup_dir = bepinex_dir / "_mod_installer_backups" / timestamp
+        failures: List[str] = []
+        backed_up_files = 0
+        deleted_files = 0
+        processed_mods = 0
+        history_changed = False
+        total_mods = len(selected_mods)
+
+        for selected_index, (original_index, mod) in enumerate(selected_mods):
+            mod_name = mod["name"]
+            processed_mods += 1
+            self.ui_queue.put(("mod_status", original_index, "Uninstalling"))
+            self.ui_queue.put(("status", f"Uninstalling {mod_name}..."))
+            self.ui_queue.put(("log", f"Uninstalling {mod_name}"))
+
+            entry = history_mods.get(mod_name)
+            if not isinstance(entry, dict):
+                self.ui_queue.put(("log", f"No install history found for {mod_name}. Skipping."))
+                self.ui_queue.put(("mod_status", original_index, "Uninstalled"))
+                self.ui_queue.put(("progress", (selected_index + 1) / total_mods))
+                continue
+
+            tracked_files = entry.get("files", [])
+            if not isinstance(tracked_files, list):
+                tracked_files = []
+
+            remaining_files = []
+            mod_failed = False
+            for relative_file in tracked_files:
+                if not isinstance(relative_file, str):
+                    continue
+
+                try:
+                    backup_count, delete_count = self._backup_and_delete_tracked_file(
+                        bepinex_dir,
+                        backup_dir,
+                        relative_file,
+                    )
+                    backed_up_files += backup_count
+                    deleted_files += delete_count
+                    if delete_count:
+                        history_changed = True
+                    else:
+                        remaining_files.append(relative_file)
+                except (OSError, ValueError) as exc:
+                    mod_failed = True
+                    failures.append(f"{mod_name}: {relative_file}: {exc}")
+                    remaining_files.append(relative_file)
+                    self.ui_queue.put(("log", f"Failed to uninstall {relative_file} for {mod_name}: {exc}"))
+
+            if remaining_files:
+                entry["files"] = remaining_files
+            else:
+                history_mods.pop(mod_name, None)
+                history_changed = True
+
+            self.ui_queue.put(("mod_status", original_index, "Failed" if mod_failed else "Uninstalled"))
+            self.ui_queue.put(("progress", (selected_index + 1) / total_mods))
+
+        history_path = ""
+        if history_changed:
+            saved_path = write_install_history(bepinex_dir, history)
+            history_path = str(saved_path)
+            self.ui_queue.put(("log", f"Updated install history: {saved_path}"))
+
+        self.ui_queue.put(("uninstall_complete", processed_mods, backed_up_files, deleted_files, failures, history_path))
+
+    def _backup_and_delete_tracked_file(self, bepinex_dir: Path, backup_dir: Path, relative_file: str) -> Tuple[int, int]:
+        relative_path = Path(relative_file)
+        if relative_path.is_absolute():
+            raise ValueError("history path is absolute; refusing to delete")
+
+        bepinex_root = bepinex_dir.resolve()
+        target_path = (bepinex_root / relative_path).resolve()
+
+        # Safety check: only delete paths that resolve inside the selected BepInEx folder.
+        try:
+            target_path.relative_to(bepinex_root)
+        except ValueError:
+            raise ValueError("resolved path is outside the selected BepInEx folder")
+
+        if not target_path.exists():
+            self.ui_queue.put(("log", f"Tracked file no longer exists, skipping: {relative_file}"))
+            return 0, 0
+        if not target_path.is_file():
+            raise ValueError("tracked path is not a file; refusing to delete")
+
+        backup_path = (backup_dir / relative_path).resolve()
+
+        # Safety check: preserve BepInEx-relative structure in the uninstall backup folder.
+        backup_root = backup_dir.resolve()
+        try:
+            backup_path.relative_to(backup_root)
+        except ValueError:
+            raise ValueError("backup path escaped uninstall backup folder")
+
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path = self._unique_destination(backup_path)
+        shutil.copy2(target_path, backup_path)
+        self.ui_queue.put(("log", f"Backed up {relative_file} to {backup_path}"))
+
+        target_path.unlink()
+        self.ui_queue.put(("log", f"Deleted tracked file: {relative_file}"))
+        return 1, 1
 
     def _resolve_bepinex_folder(self, selected_path: Path) -> Path:
         """Accept either a Valheim folder containing BepInEx or the BepInEx folder itself."""
@@ -887,6 +1044,36 @@ class ValheimModDownloader(ctk.CTk):
 
                     if dependency_warnings:
                         self._offer_to_add_missing_dependencies(dependency_warnings)
+
+                elif event_name == "uninstall_complete":
+                    _, processed_mods, backed_up_files, deleted_files, failures, history_path = event
+                    self._set_busy(False)
+                    self.progress.set(1)
+                    self.status_var.set(
+                        f"Uninstall finished: {processed_mods} mods processed, {deleted_files} deleted, "
+                        f"{backed_up_files} backed up, {len(failures)} failures"
+                    )
+                    self._append_log(
+                        f"Uninstall finished. Mods processed {processed_mods}, backed up {backed_up_files}, "
+                        f"deleted {deleted_files}, failures {len(failures)}"
+                    )
+
+                    history_text = f"\n\nInstall history updated:\n{history_path}" if history_path else ""
+                    summary = (
+                        f"{processed_mods} mods processed\n"
+                        f"{backed_up_files} files backed up\n"
+                        f"{deleted_files} files deleted\n"
+                        f"{len(failures)} failures"
+                        + history_text
+                    )
+
+                    if failures:
+                        messagebox.showwarning(
+                            "Uninstall Complete With Errors",
+                            summary + "\n\nFailures:\n" + "\n".join(failures[:10]),
+                        )
+                    else:
+                        messagebox.showinfo("Uninstall Complete", summary)
 
         except queue.Empty:
             pass
