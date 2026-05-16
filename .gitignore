@@ -12,6 +12,7 @@ env/
 build/
 dist/
 release/
+ValheimModInstaller/
 *.spec
 *.zip
 
