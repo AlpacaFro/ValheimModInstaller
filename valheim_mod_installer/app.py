@@ -69,6 +69,7 @@ class ValheimModDownloader(ctk.CTk):
         self.ui_queue: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
         self.is_busy = False
         self.selected_bepinex_path: Optional[Path] = None
+        self.missing_dependencies: List[dict] = []
 
         self.mod_name_var = ctk.StringVar()
         self.mod_url_var = ctk.StringVar()
@@ -174,12 +175,21 @@ class ValheimModDownloader(ctk.CTk):
         )
         self.uninstall_button.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
 
+        self.add_dependencies_button = ctk.CTkButton(
+            footer,
+            text="Add Missing Dependencies",
+            height=38,
+            state="disabled",
+            command=self.add_missing_dependencies,
+        )
+        self.add_dependencies_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
+
         self.progress = ctk.CTkProgressBar(footer)
-        self.progress.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.progress.set(0)
 
         self.status_label = ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.status_label.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
 
     def _render_mods(self) -> None:
         for child in self.mod_frame.winfo_children():
@@ -250,10 +260,14 @@ class ValheimModDownloader(ctk.CTk):
             self.import_button,
             self.main_action_button,
             self.uninstall_button,
+            self.add_dependencies_button,
             self.select_bepinex_button,
             self.install_mode_selector,
         ):
-            button.configure(state=state)
+            if button is self.add_dependencies_button and not busy:
+                button.configure(state="normal" if self.missing_dependencies else "disabled")
+            else:
+                button.configure(state=state)
 
     def on_install_mode_changed(self, selected_label: str) -> None:
         label_to_mode = {
@@ -296,6 +310,90 @@ class ValheimModDownloader(ctk.CTk):
 
     def _queue_log(self, message: str) -> None:
         self.ui_queue.put(("log", message))
+
+    def _set_missing_dependencies(self, dependency_warnings: List[dict]) -> None:
+        self.missing_dependencies = []
+        seen = set()
+
+        for warning in dependency_warnings:
+            url = warning.get("url", "")
+            display_name = warning.get("display_name", "")
+            if not url or not display_name:
+                continue
+
+            package_parts = parse_thunderstore_package_url(url)
+            author = package_parts[0] if package_parts else warning.get("author", "")
+            package = package_parts[1] if package_parts else warning.get("package", display_name)
+            key = (author.lower(), package.lower(), url.lower())
+            if key in seen:
+                continue
+
+            seen.add(key)
+            self.missing_dependencies.append(
+                {
+                    "display_name": display_name,
+                    "author": author,
+                    "package": package,
+                    "url": url,
+                    "required_by": warning.get("required_by", ""),
+                }
+            )
+
+        self.add_dependencies_button.configure(state="normal" if self.missing_dependencies and not self.is_busy else "disabled")
+
+    def add_missing_dependencies(self) -> None:
+        if self.is_busy:
+            return
+        if not self.missing_dependencies:
+            messagebox.showinfo("No Missing Dependencies", "There are no missing dependencies to add.")
+            return
+
+        added = 0
+        for dependency in self.missing_dependencies:
+            if self._dependency_already_in_mod_list(dependency):
+                continue
+
+            package_id = ""
+            package_parts = parse_thunderstore_package_url(dependency["url"])
+            if package_parts:
+                package_id = f"{package_parts[0]}-{package_parts[1]}"
+
+            self.mods.append(
+                {
+                    "name": dependency["display_name"],
+                    "url": dependency["url"],
+                    "enabled": True,
+                    "status": "Ready",
+                    **({"package_id": package_id} if package_id else {}),
+                }
+            )
+            added += 1
+            self._append_log(f"Added missing dependency: {dependency['display_name']} required by {dependency['required_by']}")
+
+        # Dependencies are added to the list only. The user must run install again
+        # so they can review the new mods before anything is downloaded or installed.
+        self.missing_dependencies = []
+        self.add_dependencies_button.configure(state="disabled")
+        self._render_mods()
+        messagebox.showinfo("Dependencies Added", f"Added {added} missing dependencies. Run install again.")
+
+    def _dependency_already_in_mod_list(self, dependency: dict) -> bool:
+        target_name = loose_match_key(dependency.get("display_name", ""))
+        target_url = dependency.get("url", "").lower()
+        target_author = dependency.get("author", "").lower()
+        target_package = dependency.get("package", "").lower()
+
+        for mod in self.mods:
+            if loose_match_key(str(mod.get("name", ""))) == target_name:
+                return True
+            if str(mod.get("url", "")).lower() == target_url:
+                return True
+
+            package_parts = parse_thunderstore_package_url(str(mod.get("url", "")))
+            if package_parts and package_parts[0].lower() == target_author and package_parts[1].lower() == target_package:
+                return True
+
+        return False
 
     def delete_mod(self, index: int) -> None:
         if self.is_busy:
@@ -1009,9 +1107,12 @@ class ValheimModDownloader(ctk.CTk):
                         dependency_text = "\n\nMissing dependencies detected:\n" + "\n".join(
                             self._format_dependency_warning(warning) for warning in dependency_warnings[:20]
                         )
+                        self._set_missing_dependencies(dependency_warnings)
                         self._append_log("Missing dependencies detected:")
                         for warning in dependency_warnings:
                             self._append_log(self._format_dependency_warning(warning))
+                    else:
+                        self._set_missing_dependencies([])
 
                     if failures:
                         messagebox.showwarning(
@@ -1041,9 +1142,6 @@ class ValheimModDownloader(ctk.CTk):
                             f"Backed up {backed_up_files} files."
                             + history_text,
                         )
-
-                    if dependency_warnings:
-                        self._offer_to_add_missing_dependencies(dependency_warnings)
 
                 elif event_name == "uninstall_complete":
                     _, processed_mods, backed_up_files, deleted_files, failures, history_path = event
@@ -1090,58 +1188,6 @@ class ValheimModDownloader(ctk.CTk):
     def _format_dependency_warning(self, warning: dict) -> str:
         add_text = f"\n  Add: {warning['url']}" if warning.get("url") else ""
         return f"- {warning['display_name']} required by {warning['required_by']}{add_text}"
-
-    def _offer_to_add_missing_dependencies(self, dependency_warnings: List[dict]) -> None:
-        addable = []
-        seen_urls = set()
-        for warning in dependency_warnings:
-            url = warning.get("url", "")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            addable.append(warning)
-
-        if not addable:
-            return
-
-        should_add = messagebox.askyesno(
-            "Add Missing Dependencies?",
-            "Add missing dependencies to the mod list?\n\n"
-            + "\n".join(f"- {warning['display_name']}" for warning in addable[:10]),
-        )
-        if not should_add:
-            return
-
-        existing_urls = {str(mod.get("url", "")).lower() for mod in self.mods}
-        existing_names = {loose_match_key(str(mod.get("name", ""))) for mod in self.mods}
-        added = 0
-
-        for warning in addable:
-            if warning["url"].lower() in existing_urls:
-                continue
-            if loose_match_key(warning["display_name"]) in existing_names:
-                continue
-
-            package_id = ""
-            package_parts = parse_thunderstore_package_url(warning["url"])
-            if package_parts:
-                package_id = f"{package_parts[0]}-{package_parts[1]}"
-
-            self.mods.append(
-                {
-                    "name": warning["display_name"],
-                    "url": warning["url"],
-                    "enabled": True,
-                    "status": "Ready",
-                    **({"package_id": package_id} if package_id else {}),
-                }
-            )
-            added += 1
-
-        if added:
-            self._render_mods()
-            self._append_log(f"Added {added} missing dependencies to the mod list")
-
 
 if __name__ == "__main__":
     app = ValheimModDownloader()
