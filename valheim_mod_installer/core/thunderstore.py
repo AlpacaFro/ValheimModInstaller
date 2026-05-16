@@ -30,6 +30,14 @@ def parse_thunderstore_package_url(url: str) -> Optional[Tuple[str, str]]:
 
 def get_latest_thunderstore_download_url(author: str, package: str) -> str:
     """Ask Thunderstore's package API for the latest version download URL."""
+    info = get_latest_thunderstore_package_info(author, package)
+    if info.get("download_url"):
+        return str(info["download_url"])
+    raise ValueError("Thunderstore API response did not include a latest version download URL.")
+
+
+def get_latest_thunderstore_package_info(author: str, package: str) -> dict:
+    """Ask Thunderstore's package API for latest version metadata."""
     safe_author = quote(author, safe="")
     safe_package = quote(package, safe="")
     api_url = f"https://thunderstore.io/api/experimental/package/{safe_author}/{safe_package}/"
@@ -41,11 +49,19 @@ def get_latest_thunderstore_download_url(author: str, package: str) -> str:
         raise ValueError("Thunderstore API response was not a JSON object.")
 
     if data.get("download_url"):
-        return str(data["download_url"])
+        return {
+            "version_number": str(data.get("version_number", "")),
+            "download_url": str(data["download_url"]),
+            "raw": data,
+        }
 
     latest = data.get("latest")
     if isinstance(latest, dict) and latest.get("download_url"):
-        return str(latest["download_url"])
+        return {
+            "version_number": str(latest.get("version_number", "")),
+            "download_url": str(latest["download_url"]),
+            "raw": data,
+        }
 
     versions = data.get("versions")
     if isinstance(versions, list) and versions:
@@ -59,7 +75,11 @@ def get_latest_thunderstore_download_url(author: str, package: str) -> str:
             )
         for version in clean_versions:
             if version.get("download_url"):
-                return str(version["download_url"])
+                return {
+                    "version_number": str(version.get("version_number", "")),
+                    "download_url": str(version["download_url"]),
+                    "raw": data,
+                }
 
     raise ValueError("Thunderstore API response did not include a latest version download URL.")
 

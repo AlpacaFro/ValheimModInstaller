@@ -1,5 +1,6 @@
 import json
 import queue
+import re
 import shutil
 import threading
 import zipfile
@@ -15,7 +16,12 @@ from tkinter import filedialog, messagebox
 from .core.dependencies import detect_missing_dependencies, loose_match_key
 from .core.downloader import CHUNK_SIZE, REQUEST_TIMEOUT
 from .core.install_history import load_install_history, save_installed_files, write_install_history
-from .core.thunderstore import UnsupportedURL, parse_thunderstore_package_url, resolve_download_url
+from .core.thunderstore import (
+    UnsupportedURL,
+    get_latest_thunderstore_package_info,
+    parse_thunderstore_package_url,
+    resolve_download_url,
+)
 from .models.mod import INITIAL_MODS
 from .utils.files import guess_download_filename, sanitize_filename
 
@@ -48,6 +54,18 @@ def validate_mod_data(data: object) -> List[dict]:
         clean_mod = {"name": name, "url": url, "enabled": enabled, "status": status}
         if package_id:
             clean_mod["package_id"] = package_id
+        for field in (
+            "author",
+            "package",
+            "installed_version",
+            "latest_version",
+            "latest_download_url",
+            "update_status",
+            "source_url",
+        ):
+            value = str(item.get(field, "")).strip()
+            if value:
+                clean_mod[field] = value
 
         clean_mods.append(clean_mod)
 
@@ -184,12 +202,20 @@ class ValheimModDownloader(ctk.CTk):
         )
         self.add_dependencies_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
 
+        self.check_updates_button = ctk.CTkButton(
+            footer,
+            text="Check Updates",
+            height=38,
+            command=self.check_updates,
+        )
+        self.check_updates_button.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 10))
+
         self.progress = ctk.CTkProgressBar(footer)
-        self.progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.progress.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.progress.set(0)
 
         self.status_label = ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.status_label.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 14))
 
     def _render_mods(self) -> None:
         for child in self.mod_frame.winfo_children():
@@ -221,8 +247,21 @@ class ValheimModDownloader(ctk.CTk):
             url_label.grid(row=1, column=1, sticky="ew", padx=12, pady=(0, 10))
 
             status = mod.get("status", "Ready")
-            status_label = ctk.CTkLabel(row, text=status, width=92, anchor="center", text_color=self._status_color(status))
+            status_label = ctk.CTkLabel(row, text=status, width=96, anchor="center", text_color=self._status_color(status))
             status_label.grid(row=0, column=2, rowspan=2, padx=(6, 0), pady=10)
+
+            update_status = mod.get("update_status", "")
+            update_display = update_status
+            if update_status == "Unknown version" and mod.get("latest_version"):
+                update_display = f"Unknown version\nLatest: {mod['latest_version']}"
+            update_label = ctk.CTkLabel(
+                row,
+                text=update_display,
+                width=142,
+                anchor="center",
+                text_color=self._update_status_color(update_status),
+            )
+            update_label.grid(row=0, column=3, rowspan=2, padx=(6, 0), pady=10)
 
             delete_button = ctk.CTkButton(
                 row,
@@ -232,7 +271,7 @@ class ValheimModDownloader(ctk.CTk):
                 width=88,
                 command=lambda idx=index: self.delete_mod(idx),
             )
-            delete_button.grid(row=0, column=3, rowspan=2, padx=12, pady=10)
+            delete_button.grid(row=0, column=4, rowspan=2, padx=12, pady=10)
 
         self.count_label.configure(text=f"{len(self.mods)} mod{'s' if len(self.mods) != 1 else ''} loaded")
 
@@ -251,6 +290,15 @@ class ValheimModDownloader(ctk.CTk):
         }
         return colors.get(status, "#d1d5db")
 
+    def _update_status_color(self, status: str) -> str:
+        colors = {
+            "Up to date": "#4ade80",
+            "Update available": "#facc15",
+            "Unknown version": "#93c5fd",
+            "Unknown source": "#f87171",
+        }
+        return colors.get(status, "#9ca3af")
+
     def _set_busy(self, busy: bool) -> None:
         self.is_busy = busy
         state = "disabled" if busy else "normal"
@@ -261,6 +309,7 @@ class ValheimModDownloader(ctk.CTk):
             self.main_action_button,
             self.uninstall_button,
             self.add_dependencies_button,
+            self.check_updates_button,
             self.select_bepinex_button,
             self.install_mode_selector,
         ):
@@ -439,6 +488,9 @@ class ValheimModDownloader(ctk.CTk):
             mod_data = {"name": name, "url": download_url, "enabled": True, "status": "Ready"}
             if package_id:
                 mod_data["package_id"] = f"{package_id[0]}-{package_id[1]}"
+                mod_data["author"] = package_id[0]
+                mod_data["package"] = package_id[1]
+                mod_data["source_url"] = url
             self.ui_queue.put(("validation_success", mod_data))
         except requests.RequestException as exc:
             self.ui_queue.put(("validation_error", f"Could not reach the URL: {exc}"))
@@ -466,6 +518,13 @@ class ValheimModDownloader(ctk.CTk):
                         "enabled": mod.get("enabled", True),
                         "status": mod.get("status", "Ready"),
                         **({"package_id": mod["package_id"]} if mod.get("package_id") else {}),
+                        **({"author": mod["author"]} if mod.get("author") else {}),
+                        **({"package": mod["package"]} if mod.get("package") else {}),
+                        **({"installed_version": mod["installed_version"]} if mod.get("installed_version") else {}),
+                        **({"latest_version": mod["latest_version"]} if mod.get("latest_version") else {}),
+                        **({"latest_download_url": mod["latest_download_url"]} if mod.get("latest_download_url") else {}),
+                        **({"update_status": mod["update_status"]} if mod.get("update_status") else {}),
+                        **({"source_url": mod["source_url"]} if mod.get("source_url") else {}),
                     }
                     for mod in self.mods
                 ]
@@ -577,6 +636,113 @@ class ValheimModDownloader(ctk.CTk):
             daemon=True,
         )
         worker.start()
+
+    def check_updates(self) -> None:
+        if self.is_busy:
+            return
+
+        enabled_mods = [(index, mod.copy()) for index, mod in enumerate(self.mods) if mod.get("enabled", True)]
+        if not enabled_mods:
+            messagebox.showinfo("No Enabled Mods", "No enabled mods selected.")
+            self._queue_log("Update check blocked because no enabled mods are selected")
+            return
+
+        self._set_busy(True)
+        self.progress.set(0)
+        self.status_var.set("Checking Thunderstore updates...")
+        self._queue_log(f"Checking updates for {len(enabled_mods)} enabled mods")
+
+        worker = threading.Thread(target=self._check_updates_worker, args=(enabled_mods,), daemon=True)
+        worker.start()
+
+    def _check_updates_worker(self, enabled_mods: List[Tuple[int, dict]]) -> None:
+        total_mods = len(enabled_mods)
+        checked = 0
+        update_count = 0
+        unknown_count = 0
+        failures: List[str] = []
+
+        for enabled_index, (original_index, mod) in enumerate(enabled_mods):
+            name = mod["name"]
+            self.ui_queue.put(("status", f"Checking updates for {name}..."))
+
+            package_ref = self._resolve_mod_package_reference(mod)
+            if package_ref is None:
+                unknown_count += 1
+                metadata = {"update_status": "Unknown source"}
+                self.ui_queue.put(("mod_update_checked", original_index, metadata))
+                self.ui_queue.put(("log", f"{name}: Unknown source"))
+                self.ui_queue.put(("progress", (enabled_index + 1) / total_mods))
+                continue
+
+            author, package = package_ref
+            try:
+                latest_info = get_latest_thunderstore_package_info(author, package)
+                latest_version = latest_info.get("version_number", "")
+                latest_download_url = latest_info.get("download_url", "")
+                installed_version = str(mod.get("installed_version", "")).strip()
+
+                if not installed_version:
+                    # Unknown-version handling: we can show the latest version, but
+                    # we do not claim an update is available without a known baseline.
+                    update_status = "Unknown version"
+                    unknown_count += 1
+                    log_message = f"{name}: Latest: {latest_version or 'unknown'}"
+                elif installed_version != latest_version:
+                    # Version comparison is intentionally conservative: Thunderstore
+                    # versions are treated as strings so unusual semver forms stay intact.
+                    update_status = "Update available"
+                    update_count += 1
+                    log_message = f"{name}: Update available {installed_version} -> {latest_version}"
+                else:
+                    update_status = "Up to date"
+                    log_message = f"{name}: Up to date"
+
+                checked += 1
+                metadata = {
+                    "author": author,
+                    "package": package,
+                    "package_id": f"{author}-{package}",
+                    "latest_version": latest_version,
+                    "latest_download_url": latest_download_url,
+                    "update_status": update_status,
+                }
+                self.ui_queue.put(("mod_update_checked", original_index, metadata))
+                self.ui_queue.put(("log", log_message))
+            except (requests.RequestException, ValueError) as exc:
+                unknown_count += 1
+                failures.append(f"{name}: {exc}")
+                self.ui_queue.put(("mod_update_checked", original_index, {"update_status": "Unknown source"}))
+                self.ui_queue.put(("log", f"{name}: Unknown source ({exc})"))
+
+            self.ui_queue.put(("progress", (enabled_index + 1) / total_mods))
+
+        self.ui_queue.put(("updates_complete", checked, update_count, unknown_count, failures))
+
+    def _resolve_mod_package_reference(self, mod: dict) -> Optional[Tuple[str, str]]:
+        url = str(mod.get("source_url") or mod.get("url") or "")
+        package_ref = parse_thunderstore_package_url(url)
+        if package_ref:
+            return package_ref
+
+        author = str(mod.get("author", "")).strip()
+        package = str(mod.get("package", "")).strip()
+        if author and package:
+            return author, package
+
+        package_id = str(mod.get("package_id", "")).strip()
+        if "-" in package_id:
+            author, package = package_id.split("-", 1)
+            if author and package:
+                return author, package
+
+        # Resolved Thunderstore download URLs often include Author-Package-Version.
+        # Recover Author/Package when that pattern is visible in the direct URL.
+        match = re.search(r"([A-Za-z0-9_]+)-([A-Za-z0-9_]+)-\d+(?:\.\d+)*", url)
+        if match:
+            return match.group(1), match.group(2)
+
+        return None
 
     def _uninstall_worker(self, selected_mods: List[Tuple[int, dict]], bepinex_dir: Path) -> None:
         history = load_install_history(bepinex_dir)
@@ -762,7 +928,17 @@ class ValheimModDownloader(ctk.CTk):
                     package_id = parse_thunderstore_package_url(mod["url"])
                     if package_id:
                         mod["package_id"] = f"{package_id[0]}-{package_id[1]}"
+                        mod["author"] = package_id[0]
+                        mod["package"] = package_id[1]
+                        mod["source_url"] = mod["url"]
                         self.ui_queue.put(("mod_package_id_resolved", original_index, mod["package_id"]))
+                        self.ui_queue.put(
+                            (
+                                "mod_metadata_resolved",
+                                original_index,
+                                {"author": package_id[0], "package": package_id[1], "source_url": mod["url"]},
+                            )
+                        )
                     self.ui_queue.put(("mod_url_resolved", original_index, download_url))
                     mod["url"] = download_url
 
@@ -1085,6 +1261,19 @@ class ValheimModDownloader(ctk.CTk):
                     if 0 <= index < len(self.mods):
                         self.mods[index]["package_id"] = package_id
 
+                elif event_name == "mod_metadata_resolved":
+                    _, index, metadata = event
+                    if 0 <= index < len(self.mods):
+                        self.mods[index].update(metadata)
+
+                elif event_name == "mod_update_checked":
+                    _, index, metadata = event
+                    if 0 <= index < len(self.mods):
+                        for key, value in metadata.items():
+                            if value:
+                                self.mods[index][key] = value
+                        self._render_mods()
+
                 elif event_name == "downloads_complete":
                     _, successes, gathered_dlls, installed_files, backed_up_files, history_path, failures, dependency_warnings = event
                     self._set_busy(False)
@@ -1172,6 +1361,33 @@ class ValheimModDownloader(ctk.CTk):
                         )
                     else:
                         messagebox.showinfo("Uninstall Complete", summary)
+
+                elif event_name == "updates_complete":
+                    _, checked, update_count, unknown_count, failures = event
+                    self._set_busy(False)
+                    self.progress.set(1)
+                    self.status_var.set(
+                        f"Update check finished: {checked} checked, {update_count} updates, "
+                        f"{unknown_count} unknown, {len(failures)} failures"
+                    )
+                    self._append_log(
+                        f"Update check finished. Checked {checked}, updates {update_count}, "
+                        f"unknown {unknown_count}, failures {len(failures)}"
+                    )
+
+                    summary = (
+                        f"{checked} mods checked\n"
+                        f"{update_count} updates available\n"
+                        f"{unknown_count} unknown source/version\n"
+                        f"{len(failures)} failures"
+                    )
+                    if failures:
+                        messagebox.showwarning(
+                            "Update Check Complete With Errors",
+                            summary + "\n\nFailures:\n" + "\n".join(failures[:10]),
+                        )
+                    else:
+                        messagebox.showinfo("Update Check Complete", summary)
 
         except queue.Empty:
             pass
