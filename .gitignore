@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# PyInstaller/build output
+build/
+dist/
+*.spec
+*.zip
+
+# Local installer state/output
+_extracted/
+ready_plugins/
+downloads/
+
+# Editor/OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
