@@ -1,12 +1,15 @@
 import json
+import os
 import queue
 import re
 import shutil
+import tkinter as tk
 import threading
 import zipfile
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import customtkinter as ctk
@@ -24,6 +27,246 @@ from .core.thunderstore import (
 )
 from .models.mod import INITIAL_MODS
 from .utils.files import guess_download_filename, sanitize_filename
+
+
+COLORS = {
+    "bg": "#0B1020",
+    "surface": "#111827",
+    "surface_2": "#172033",
+    "card": "#1B2540",
+    "card_hover": "#24314F",
+    "primary": "#38BDF8",
+    "primary_hover": "#0EA5E9",
+    "secondary": "#8B5CF6",
+    "secondary_hover": "#7C3AED",
+    "success": "#22C55E",
+    "success_hover": "#16A34A",
+    "warning": "#F59E0B",
+    "warning_hover": "#D97706",
+    "danger": "#EF4444",
+    "danger_hover": "#DC2626",
+    "pink": "#EC4899",
+    "text": "#F8FAFC",
+    "muted": "#94A3B8",
+    "muted_2": "#64748B",
+    "border": "#334155",
+    "border_hot": "#38BDF8",
+}
+
+LIGHT_COLORS = {
+    "bg": "#EAF3FF",
+    "surface": "#F8FAFC",
+    "surface_2": "#E2E8F0",
+    "card": "#FFFFFF",
+    "card_hover": "#EEF6FF",
+    "primary": "#0284C7",
+    "primary_hover": "#0369A1",
+    "secondary": "#7C3AED",
+    "secondary_hover": "#6D28D9",
+    "success": "#16A34A",
+    "success_hover": "#15803D",
+    "warning": "#D97706",
+    "warning_hover": "#B45309",
+    "danger": "#DC2626",
+    "danger_hover": "#B91C1C",
+    "pink": "#DB2777",
+    "text": "#0F172A",
+    "muted": "#475569",
+    "muted_2": "#64748B",
+    "border": "#CBD5E1",
+    "border_hot": "#0284C7",
+}
+
+
+def style_primary_button(button: Any) -> None:
+    """Centralized theme helper: bright cyan is reserved for the main happy path."""
+    button.configure(
+        corner_radius=18,
+        fg_color=COLORS["primary"],
+        hover_color=COLORS["primary_hover"],
+        text_color="#03111F",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        border_width=1,
+        border_color="#7DD3FC",
+    )
+
+
+def style_secondary_button(button: Any) -> None:
+    """Centralized theme helper: purple buttons are supportive, not primary."""
+    button.configure(
+        corner_radius=16,
+        fg_color=COLORS["secondary"],
+        hover_color=COLORS["secondary_hover"],
+        text_color=COLORS["text"],
+        font=ctk.CTkFont(size=13, weight="bold"),
+        border_width=1,
+        border_color="#A78BFA",
+    )
+
+
+def style_muted_button(button: Any) -> None:
+    button.configure(
+        corner_radius=16,
+        fg_color=COLORS["surface_2"],
+        hover_color=COLORS["card_hover"],
+        text_color=COLORS["text"],
+        font=ctk.CTkFont(size=13, weight="bold"),
+        border_width=1,
+        border_color=COLORS["border"],
+    )
+
+
+def style_danger_button(button: Any) -> None:
+    button.configure(
+        corner_radius=16,
+        fg_color=COLORS["danger"],
+        hover_color=COLORS["danger_hover"],
+        text_color=COLORS["text"],
+        font=ctk.CTkFont(size=13, weight="bold"),
+        border_width=1,
+        border_color=COLORS["pink"],
+    )
+
+
+def create_status_badge(parent: Any, text: str, width: int = 118) -> ctk.CTkLabel:
+    """Centralized badge helper keeps all status pills visually consistent."""
+    style = get_status_style(text)
+    return ctk.CTkLabel(
+        parent,
+        text=text,
+        width=width,
+        height=26,
+        corner_radius=14,
+        fg_color=style["fg_color"],
+        text_color=style["text_color"],
+        font=ctk.CTkFont(size=12, weight="bold"),
+    )
+
+
+@dataclass
+class InstalledPluginRecord:
+    dll_file_name: str
+    absolute_path: str
+    relative_path: str
+    source: str
+
+
+@dataclass
+class InstalledPluginIndex:
+    records: List[InstalledPluginRecord] = field(default_factory=list)
+    by_mod_name: Dict[str, List[InstalledPluginRecord]] = field(default_factory=dict)
+    by_dll_name: Dict[str, InstalledPluginRecord] = field(default_factory=dict)
+    by_loose_name: Dict[str, InstalledPluginRecord] = field(default_factory=dict)
+    by_source_url: Dict[str, List[InstalledPluginRecord]] = field(default_factory=dict)
+
+
+def scan_installed_plugins(bepinex_path: Path) -> InstalledPluginIndex:
+    index = InstalledPluginIndex()
+    bepinex_root = bepinex_path.resolve()
+    history = load_install_history(bepinex_root)
+    history_mods = history.get("mods", {})
+
+    def add_record(record: InstalledPluginRecord, mod_name: str = "", source_url: str = "") -> None:
+        index.records.append(record)
+        if mod_name:
+            index.by_mod_name.setdefault(loose_match_key(mod_name), []).append(record)
+        if source_url:
+            index.by_source_url.setdefault(source_url.lower(), []).append(record)
+        index.by_dll_name.setdefault(record.dll_file_name.lower(), record)
+        index.by_loose_name.setdefault(loose_match_key(Path(record.dll_file_name).stem), record)
+
+    if isinstance(history_mods, dict):
+        for mod_name, entry in history_mods.items():
+            if not isinstance(entry, dict):
+                continue
+            source_url = str(entry.get("source_url", ""))
+            for relative_file in entry.get("files", []):
+                if not isinstance(relative_file, str) or not relative_file.lower().endswith(".dll"):
+                    continue
+                absolute_path = bepinex_root / relative_file
+                add_record(
+                    InstalledPluginRecord(
+                        dll_file_name=Path(relative_file).name,
+                        absolute_path=str(absolute_path),
+                        relative_path=relative_file,
+                        source="history",
+                    ),
+                    str(mod_name),
+                    source_url,
+                )
+
+    for folder_name in ("plugins", "patchers"):
+        scan_root = bepinex_root / folder_name
+        if not scan_root.exists():
+            continue
+        for dll_path in scan_root.rglob("*.dll"):
+            try:
+                relative_path = dll_path.resolve().relative_to(bepinex_root).as_posix()
+            except ValueError:
+                continue
+            if dll_path.name.lower() in index.by_dll_name:
+                continue
+            add_record(
+                InstalledPluginRecord(
+                    dll_file_name=dll_path.name,
+                    absolute_path=str(dll_path.resolve()),
+                    relative_path=relative_path,
+                    source="filesystem",
+                )
+            )
+
+    return index
+
+
+def normalize_bepinex_selection(selected_path: Path) -> Optional[Path]:
+    """Accept the BepInEx folder itself or a Valheim folder containing BepInEx."""
+    try:
+        selected_path = selected_path.resolve()
+    except OSError:
+        return None
+
+    if selected_path.name.lower() == "bepinex":
+        return selected_path
+
+    nested_bepinex = selected_path / "BepInEx"
+    if nested_bepinex.exists():
+        return nested_bepinex
+
+    if (selected_path / "Valheim.exe").exists() and nested_bepinex.exists():
+        return nested_bepinex
+
+    return None
+
+
+def validate_bepinex_path(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    if path.name.lower() == "bepinex":
+        return True
+    return any((path / child).exists() for child in ("plugins", "config", "patchers", "core"))
+
+
+def get_status_style(status: str) -> dict:
+    normalized = str(status or "Ready").strip().lower()
+    styles = {
+        "ready": {"fg_color": COLORS["surface_2"], "text_color": COLORS["text"]},
+        "missing": {"fg_color": "#075985", "text_color": "#E0F2FE"},
+        "downloading": {"fg_color": COLORS["primary_hover"], "text_color": "#E0F2FE"},
+        "downloaded": {"fg_color": "#2563EB", "text_color": "#EFF6FF"},
+        "extracting": {"fg_color": COLORS["warning"], "text_color": "#111827"},
+        "installing": {"fg_color": "#F97316", "text_color": "#111827"},
+        "installed": {"fg_color": COLORS["success"], "text_color": "#052E16"},
+        "failed": {"fg_color": COLORS["danger"], "text_color": "#FFF1F2"},
+        "disabled": {"fg_color": COLORS["border"], "text_color": COLORS["muted"]},
+        "update available": {"fg_color": COLORS["warning"], "text_color": "#111827"},
+        "missing dependencies": {"fg_color": COLORS["pink"], "text_color": "#FFF1F2"},
+        "uninstalling": {"fg_color": "#F97316", "text_color": "#111827"},
+        "uninstalled": {"fg_color": COLORS["success"], "text_color": "#052E16"},
+        "up to date": {"fg_color": COLORS["success"], "text_color": "#052E16"},
+        "unknown version": {"fg_color": COLORS["secondary"], "text_color": COLORS["text"]},
+        "unknown source": {"fg_color": COLORS["danger"], "text_color": "#FFF1F2"},
+    }
+    return styles.get(normalized, {"fg_color": COLORS["surface_2"], "text_color": COLORS["text"]})
 
 
 def validate_mod_data(data: object) -> List[dict]:
@@ -82,20 +325,37 @@ class ValheimModDownloader(ctk.CTk):
         self.title("Valheim Mod Downloader")
         self.geometry("920x680")
         self.minsize(760, 560)
+        self.configure(fg_color=COLORS["bg"])
 
         self.mods = [mod.copy() for mod in INITIAL_MODS]
         self.ui_queue: "queue.Queue[Tuple[Any, ...]]" = queue.Queue()
         self.is_busy = False
         self.selected_bepinex_path: Optional[Path] = None
         self.missing_dependencies: List[dict] = []
+        self.installed_plugin_index = InstalledPluginIndex()
+        self.pending_skipped_installed = 0
+        self.recent_logs: List[str] = []
+        self.mod_details_modal: Optional[ctk.CTkToplevel] = None
+        self.mod_details_icon_image: Optional[tk.PhotoImage] = None
 
         self.mod_name_var = ctk.StringVar()
         self.mod_url_var = ctk.StringVar()
         self.status_var = ctk.StringVar(value="Ready")
-        self.bepinex_path_var = ctk.StringVar(value="No BepInEx folder selected")
+        self.bepinex_path_var = ctk.StringVar(value="No folder selected")
+        self.bepinex_validation_var = ctk.StringVar(value="Invalid")
         self.install_mode_var = ctk.StringVar(value="gather_dlls")
+        self.mod_search_var = ctk.StringVar()
+        self.mod_filter_var = ctk.StringVar(value="All")
+        self.overwrite_installed_var = ctk.BooleanVar(value=False)
+        self.show_advanced_var = ctk.BooleanVar(value=False)
+        self.show_disabled_var = ctk.BooleanVar(value=False)
+        self.show_modal_technical_var = ctk.BooleanVar(value=False)
+        # UI-only state: card expansion and list filters are intentionally not exported.
+        self.expanded_mods: set[int] = set()
+        self.mod_search_var.trace_add("write", lambda *_: self._render_mods())
 
         self._build_ui()
+        self._refresh_action_availability()
         self._render_mods()
         self.after(100, self._process_ui_queue)
 
@@ -103,201 +363,915 @@ class ValheimModDownloader(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
 
-        header = ctk.CTkFrame(self, corner_radius=0)
-        header.grid(row=0, column=0, sticky="ew")
-        header.grid_columnconfigure(1, weight=1)
-        header.grid_columnconfigure(3, weight=2)
+        setup_frame = ctk.CTkFrame(self, corner_radius=22, fg_color=COLORS["surface"], border_width=1, border_color=COLORS["border"])
+        setup_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        setup_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(header, text="Mod Name").grid(row=0, column=0, padx=(16, 8), pady=16)
-        self.name_entry = ctk.CTkEntry(header, textvariable=self.mod_name_var, placeholder_text="Better Portals")
-        self.name_entry.grid(row=0, column=1, padx=(0, 12), pady=16, sticky="ew")
-
-        ctk.CTkLabel(header, text="Thunderstore Page / Direct URL").grid(row=0, column=2, padx=(0, 8), pady=16)
-        self.url_entry = ctk.CTkEntry(
-            header,
-            textvariable=self.mod_url_var,
-            placeholder_text="https://thunderstore.io/c/valheim/p/Tekla/AutoRepair/",
+        ctk.CTkLabel(
+            setup_frame,
+            text="Valheim Mod Installer",
+            font=ctk.CTkFont(size=28, weight="bold"),
+            text_color=COLORS["text"],
+        ).grid(
+            row=0,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            padx=20,
+            pady=(18, 4),
         )
-        self.url_entry.grid(row=0, column=3, padx=(0, 12), pady=16, sticky="ew")
-
-        self.add_button = ctk.CTkButton(header, text="Add to List", command=self.add_mod)
-        self.add_button.grid(row=0, column=4, padx=(0, 16), pady=16)
-
-        toolbar = ctk.CTkFrame(self, corner_radius=0)
-        toolbar.grid(row=1, column=0, sticky="ew", padx=16, pady=(16, 8))
-        toolbar.grid_columnconfigure(2, weight=1)
-
-        self.export_button = ctk.CTkButton(toolbar, text="Export List", command=self.export_list)
-        self.export_button.grid(row=0, column=0, padx=(0, 10), pady=12)
-
-        self.import_button = ctk.CTkButton(toolbar, text="Import List", command=self.import_list)
-        self.import_button.grid(row=0, column=1, padx=(0, 10), pady=12)
-
-        self.count_label = ctk.CTkLabel(toolbar, text="")
-        self.count_label.grid(row=0, column=3, padx=12, pady=12)
-
-        bepinex_bar = ctk.CTkFrame(self, corner_radius=0)
-        bepinex_bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        bepinex_bar.grid_columnconfigure(1, weight=1)
+        self.bepinex_path_label = ctk.CTkLabel(
+            setup_frame,
+            textvariable=self.bepinex_path_var,
+            anchor="w",
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=13),
+        )
+        self.bepinex_path_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 16))
 
         self.select_bepinex_button = ctk.CTkButton(
-            bepinex_bar,
+            setup_frame,
             text="Select BepInEx Folder",
             command=self.select_bepinex_folder,
         )
-        self.select_bepinex_button.grid(row=0, column=0, padx=(0, 10), pady=10)
+        self.select_bepinex_button.grid(row=1, column=2, padx=(0, 10), pady=(0, 12))
+        style_secondary_button(self.select_bepinex_button)
 
-        self.bepinex_path_label = ctk.CTkLabel(
-            bepinex_bar,
-            textvariable=self.bepinex_path_var,
-            anchor="w",
-            text_color="#facc15",
+        self.open_bepinex_button = ctk.CTkButton(
+            setup_frame,
+            text="Open BepInEx Folder",
+            command=self.open_bepinex_folder,
+            state="disabled",
         )
-        self.bepinex_path_label.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=10)
+        self.open_bepinex_button.grid(row=1, column=3, padx=(0, 16), pady=(0, 12))
+        style_muted_button(self.open_bepinex_button)
 
-        self.mod_frame = ctk.CTkScrollableFrame(self, label_text="Current Mod List")
-        self.mod_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=8)
-        self.mod_frame.grid_columnconfigure(0, weight=1)
+        self.bepinex_validation_label = ctk.CTkLabel(
+            setup_frame,
+            textvariable=self.bepinex_validation_var,
+            width=86,
+            height=28,
+            corner_radius=14,
+            fg_color=COLORS["surface_2"],
+            text_color=COLORS["warning"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.bepinex_validation_label.grid(row=0, column=3, sticky="e", padx=18, pady=(18, 4))
 
-        self.log_box = ctk.CTkTextbox(self, height=120, wrap="word")
-        self.log_box.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
-        self.log_box.configure(state="disabled")
+        action_frame = ctk.CTkFrame(self, corner_radius=22, fg_color=COLORS["surface"], border_width=1, border_color=COLORS["border"])
+        action_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(16, 8))
+        action_frame.grid_columnconfigure(3, weight=1)
 
-        footer = ctk.CTkFrame(self, corner_radius=0)
-        footer.grid(row=5, column=0, sticky="ew")
-        footer.grid_columnconfigure(0, weight=1)
+        self.import_button = ctk.CTkButton(action_frame, text="Load Pack", command=self.import_list)
+        self.import_button.grid(row=0, column=0, padx=(0, 10), pady=(12, 6))
+        style_secondary_button(self.import_button)
+
+        self.export_button = ctk.CTkButton(action_frame, text="Save Pack", command=self.export_list)
+        self.export_button.grid(row=0, column=1, padx=(0, 10), pady=(12, 6))
+        style_secondary_button(self.export_button)
+
+        self.check_installed_button = ctk.CTkButton(action_frame, text="Scan", command=self.check_installed_mods)
+        self.check_installed_button.grid(row=0, column=2, padx=(0, 10), pady=(12, 6))
+        style_secondary_button(self.check_installed_button)
+
+        self.count_label = ctk.CTkLabel(action_frame, text="", anchor="e", text_color=COLORS["muted"], font=ctk.CTkFont(size=13, weight="bold"))
+        self.count_label.grid(row=0, column=3, sticky="ew", padx=12, pady=(12, 6))
+
+        self.main_action_button = ctk.CTkButton(
+            action_frame,
+            text="Install Missing",
+            height=42,
+            command=self.install_missing_mods,
+        )
+        self.main_action_button.grid(row=1, column=0, columnspan=3, sticky="ew", padx=(0, 10), pady=(6, 12))
+        style_primary_button(self.main_action_button)
+
+        self.overwrite_checkbox = ctk.CTkCheckBox(
+            action_frame,
+            text="Repair existing mods",
+            variable=self.overwrite_installed_var,
+        )
+        self.overwrite_checkbox.grid(row=1, column=3, sticky="w", padx=12, pady=(6, 12))
+        self.overwrite_checkbox.configure(
+            text_color=COLORS["muted"],
+            fg_color=COLORS["primary"],
+            hover_color=COLORS["primary_hover"],
+            border_color=COLORS["border"],
+            checkbox_width=20,
+            checkbox_height=20,
+        )
+
+        self.advanced_checkbox = ctk.CTkCheckBox(
+            action_frame,
+            text="Advanced",
+            variable=self.show_advanced_var,
+            command=self._toggle_advanced_actions,
+        )
+        self.advanced_checkbox.grid(row=1, column=4, sticky="e", padx=(0, 12), pady=(6, 12))
+        self.advanced_checkbox.configure(
+            text_color=COLORS["muted"],
+            fg_color=COLORS["secondary"],
+            hover_color=COLORS["secondary_hover"],
+            border_color=COLORS["border"],
+            checkbox_width=20,
+            checkbox_height=20,
+        )
+
+        self.show_disabled_checkbox = ctk.CTkCheckBox(
+            action_frame,
+            text="Show disabled",
+            variable=self.show_disabled_var,
+            command=self._render_mods,
+        )
+        self.show_disabled_checkbox.grid(row=2, column=0, sticky="w", padx=(0, 10), pady=(0, 12))
+        self.show_disabled_checkbox.configure(
+            text_color=COLORS["muted"],
+            fg_color=COLORS["surface_2"],
+            hover_color=COLORS["card_hover"],
+            border_color=COLORS["border"],
+            checkbox_width=18,
+            checkbox_height=18,
+        )
+
+        self.next_step_label = ctk.CTkLabel(
+            action_frame,
+            text="Select your BepInEx folder to scan and install mods.",
+            anchor="w",
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.next_step_label.grid(row=2, column=1, columnspan=4, sticky="ew", padx=(0, 12), pady=(0, 12))
+
+        self.advanced_frame = ctk.CTkFrame(self, corner_radius=18, fg_color=COLORS["surface_2"], border_width=1, border_color=COLORS["border"])
+        self.advanced_frame.grid_columnconfigure(1, weight=1)
+        self.advanced_frame.grid_columnconfigure(3, weight=2)
+
+        ctk.CTkLabel(self.advanced_frame, text="Mod Name", text_color=COLORS["muted"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, padx=(12, 8), pady=10)
+        self.name_entry = ctk.CTkEntry(
+            self.advanced_frame,
+            textvariable=self.mod_name_var,
+            placeholder_text="Better Portals",
+            corner_radius=14,
+            fg_color=COLORS["surface"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            placeholder_text_color=COLORS["muted_2"],
+        )
+        self.name_entry.grid(row=0, column=1, padx=(0, 12), pady=10, sticky="ew")
+
+        ctk.CTkLabel(self.advanced_frame, text="Thunderstore / Direct URL", text_color=COLORS["muted"], font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=2, padx=(0, 8), pady=10)
+        self.url_entry = ctk.CTkEntry(
+            self.advanced_frame,
+            textvariable=self.mod_url_var,
+            placeholder_text="https://thunderstore.io/c/valheim/p/Tekla/AutoRepair/",
+            corner_radius=14,
+            fg_color=COLORS["surface"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            placeholder_text_color=COLORS["muted_2"],
+        )
+        self.url_entry.grid(row=0, column=3, padx=(0, 12), pady=10, sticky="ew")
+
+        self.add_button = ctk.CTkButton(self.advanced_frame, text="Add Mod", command=self.add_mod)
+        self.add_button.grid(row=0, column=4, padx=(0, 12), pady=10)
+        style_primary_button(self.add_button)
 
         self.install_mode_selector = ctk.CTkSegmentedButton(
-            footer,
+            self.advanced_frame,
             values=["Download only", "Download + Gather DLLs", "Full BepInEx Install"],
             command=self.on_install_mode_changed,
         )
-        self.install_mode_selector.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 10))
-        self.install_mode_selector.set("Download + Gather DLLs")
+        self.install_mode_selector.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+        self.install_mode_selector.set("Full BepInEx Install")
+        self.install_mode_selector.configure(
+            corner_radius=16,
+            fg_color=COLORS["surface"],
+            selected_color=COLORS["primary"],
+            selected_hover_color=COLORS["primary_hover"],
+            unselected_color=COLORS["surface_2"],
+            unselected_hover_color=COLORS["card_hover"],
+            text_color=COLORS["text"],
+        )
+        self.install_mode_var.set("full_install")
 
-        self.main_action_button = ctk.CTkButton(
-            footer,
-            text="Download and Gather DLLs",
-            height=42,
+        self.run_mode_button = ctk.CTkButton(
+            self.advanced_frame,
+            text="Run Selected Mode",
             command=self.run_selected_mode,
         )
-        self.main_action_button.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.run_mode_button.grid(row=1, column=2, sticky="ew", padx=(0, 10), pady=(0, 10))
+        style_muted_button(self.run_mode_button)
 
         self.uninstall_button = ctk.CTkButton(
-            footer,
-            text="Uninstall Selected Mods",
-            height=38,
+            self.advanced_frame,
+            text="Uninstall Enabled Mods",
             fg_color="#7f1d1d",
             hover_color="#991b1b",
             command=self.uninstall_selected_mods,
         )
-        self.uninstall_button.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.uninstall_button.grid(row=1, column=3, sticky="ew", padx=(0, 10), pady=(0, 10))
+        style_danger_button(self.uninstall_button)
 
         self.add_dependencies_button = ctk.CTkButton(
-            footer,
+            self.advanced_frame,
             text="Add Missing Dependencies",
-            height=38,
             state="disabled",
             command=self.add_missing_dependencies,
         )
-        self.add_dependencies_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.add_dependencies_button.grid(row=1, column=4, sticky="ew", padx=(0, 10), pady=(0, 10))
+        style_secondary_button(self.add_dependencies_button)
 
         self.check_updates_button = ctk.CTkButton(
-            footer,
+            self.advanced_frame,
             text="Check Updates",
-            height=38,
             command=self.check_updates,
         )
-        self.check_updates_button.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.check_updates_button.grid(row=2, column=4, sticky="ew", padx=(0, 12), pady=(0, 10))
+        style_secondary_button(self.check_updates_button)
+
+        self.log_box = ctk.CTkTextbox(
+            self.advanced_frame,
+            height=120,
+            wrap="word",
+            corner_radius=16,
+            fg_color=COLORS["surface"],
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["muted"],
+        )
+        self.log_box.grid(row=3, column=0, columnspan=5, sticky="ew", padx=12, pady=(0, 12))
+        self.log_box.configure(state="disabled")
+
+        self.mod_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=COLORS["bg"])
+        self.mod_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=8)
+        self.mod_frame.grid_columnconfigure(0, weight=1)
+        self.mod_frame.grid_rowconfigure(0, weight=1)
+
+        footer = ctk.CTkFrame(self, corner_radius=0, fg_color=COLORS["bg"])
+        footer.grid(row=4, column=0, sticky="ew")
+        footer.grid_columnconfigure(0, weight=1)
 
         self.progress = ctk.CTkProgressBar(footer)
-        self.progress.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.progress.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 8))
+        self.progress.configure(progress_color=COLORS["primary"], fg_color=COLORS["surface_2"], border_color=COLORS["border"])
         self.progress.set(0)
 
-        self.status_label = ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w")
-        self.status_label.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.status_label = ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w", text_color=COLORS["muted"])
+        self.status_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
 
     def _render_mods(self) -> None:
         for child in self.mod_frame.winfo_children():
             child.destroy()
 
+        columns = {
+            "To Install": [],
+            "Installed": [],
+            "Needs Attention": [],
+        }
         for index, mod in enumerate(self.mods):
-            enabled = mod.get("enabled", True)
-            text_color = "#d1d5db" if enabled else "#6b7280"
-            url_color = "#9ca3af" if enabled else "#4b5563"
+            column_name = self._kanban_column_for_mod(index, mod)
+            if column_name == "Disabled" and not self.show_disabled_var.get():
+                continue
+            if column_name == "Disabled":
+                column_name = "Needs Attention"
+            columns[column_name].append((index, mod))
 
-            row = ctk.CTkFrame(self.mod_frame)
-            row.grid(row=index, column=0, sticky="ew", padx=6, pady=6)
-            row.grid_columnconfigure(1, weight=1)
-
-            enabled_var = ctk.BooleanVar(value=enabled)
-            enabled_checkbox = ctk.CTkCheckBox(
-                row,
-                text="",
-                variable=enabled_var,
-                width=28,
-                command=lambda idx=index: self.toggle_mod_enabled(idx),
+        for column_index, (column_name, column_mods) in enumerate(columns.items()):
+            self.mod_frame.grid_columnconfigure(column_index, weight=1, uniform="kanban")
+            column = ctk.CTkScrollableFrame(
+                self.mod_frame,
+                label_text=f"{column_name} ({len(column_mods)})",
+                corner_radius=20,
+                fg_color=COLORS["surface"],
+                border_width=1,
+                border_color=COLORS["border"],
+                label_fg_color=COLORS["surface_2"],
+                label_text_color=COLORS["text"],
             )
-            enabled_checkbox.grid(row=0, column=0, rowspan=2, padx=(12, 4), pady=10)
+            column.grid(row=0, column=column_index, sticky="nsew", padx=10, pady=6)
+            column.grid_columnconfigure(0, weight=1)
 
-            label = ctk.CTkLabel(row, text=mod["name"], anchor="w", text_color=text_color)
-            label.grid(row=0, column=1, sticky="ew", padx=12, pady=10)
+            if not column_mods:
+                ctk.CTkLabel(column, text="Nothing here", text_color=COLORS["muted_2"], font=ctk.CTkFont(size=13)).grid(
+                    row=0,
+                    column=0,
+                    sticky="ew",
+                    padx=8,
+                    pady=28,
+                )
+                continue
 
-            url_label = ctk.CTkLabel(row, text=mod["url"], anchor="w", text_color=url_color)
-            url_label.grid(row=1, column=1, sticky="ew", padx=12, pady=(0, 10))
+            for row_index, (mod_index, mod) in enumerate(column_mods):
+                self._render_kanban_card(column, row_index, mod_index, mod, column_name)
 
-            status = mod.get("status", "Ready")
-            status_label = ctk.CTkLabel(row, text=status, width=96, anchor="center", text_color=self._status_color(status))
-            status_label.grid(row=0, column=2, rowspan=2, padx=(6, 0), pady=10)
+        hidden_disabled = sum(1 for mod in self.mods if not mod.get("enabled", True) and not self.show_disabled_var.get())
+        hidden_text = f" | {hidden_disabled} disabled hidden" if hidden_disabled else ""
+        self.count_label.configure(text=f"{len(self.mods)} mod{'s' if len(self.mods) != 1 else ''}{hidden_text}")
 
-            update_status = mod.get("update_status", "")
-            update_display = update_status
-            if update_status == "Unknown version" and mod.get("latest_version"):
-                update_display = f"Unknown version\nLatest: {mod['latest_version']}"
-            update_label = ctk.CTkLabel(
-                row,
-                text=update_display,
-                width=142,
-                anchor="center",
-                text_color=self._update_status_color(update_status),
+    def _render_kanban_card(self, parent: Any, row_index: int, mod_index: int, mod: dict, column_name: str) -> None:
+        accent = self._column_accent_color(column_name)
+        card = ctk.CTkFrame(parent, corner_radius=18, fg_color=COLORS["card"], border_width=1, border_color=accent)
+        card.grid(row=row_index, column=0, sticky="ew", padx=7, pady=8)
+        card.grid_columnconfigure(1, weight=1)
+        self._bind_open_mod_modal(card, mod_index)
+
+        accent_strip = ctk.CTkFrame(card, width=5, corner_radius=8, fg_color=accent)
+        accent_strip.grid(row=0, column=0, rowspan=5, sticky="nsw", padx=(8, 0), pady=10)
+
+        name_label = ctk.CTkLabel(
+            card,
+            text=mod["name"],
+            anchor="w",
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(size=15, weight="bold"),
+            wraplength=320,
+        )
+        name_label.grid(row=0, column=1, sticky="ew", padx=12, pady=(12, 6))
+        self._bind_open_mod_modal(name_label, mod_index)
+
+        badge_text = self._simple_status_label(mod_index, mod)
+        badge = create_status_badge(card, badge_text, width=124)
+        badge.grid(row=1, column=1, sticky="w", padx=12, pady=(0, 8))
+        self._bind_open_mod_modal(badge, mod_index)
+
+        action_row = ctk.CTkFrame(card, fg_color="transparent")
+        action_row.grid(row=2, column=1, sticky="ew", padx=12, pady=(0, 12))
+        action_row.grid_columnconfigure(1, weight=1)
+
+        actions = self._card_actions_for_column(column_name, mod_index)
+        for action_index, (label, command) in enumerate(actions):
+            button = ctk.CTkButton(action_row, text=label, width=78, height=30, command=command)
+            button.grid(
+                row=0,
+                column=action_index,
+                sticky="ew",
+                padx=(0, 6),
             )
-            update_label.grid(row=0, column=3, rowspan=2, padx=(6, 0), pady=10)
+            if label in {"Install", "Update", "Repair"}:
+                style_primary_button(button)
+                if self.selected_bepinex_path is None:
+                    button.configure(state="disabled")
+            elif label == "Uninstall":
+                style_danger_button(button)
+            else:
+                style_muted_button(button)
 
-            delete_button = ctk.CTkButton(
-                row,
-                text="Delete",
-                fg_color="#b91c1c",
-                hover_color="#991b1b",
-                width=88,
-                command=lambda idx=index: self.delete_mod(idx),
+    def _column_accent_color(self, column_name: str) -> str:
+        colors = {
+            "To Install": COLORS["primary"],
+            "Installed": COLORS["success"],
+            "Needs Attention": COLORS["warning"],
+            "Disabled": COLORS["muted_2"],
+        }
+        return colors.get(column_name, COLORS["border"])
+
+    def _bind_open_mod_modal(self, widget: Any, mod_index: int) -> None:
+        widget.bind("<Button-1>", lambda _event, idx=mod_index: self.open_mod_details_modal(idx))
+        try:
+            widget.configure(cursor="hand2")
+        except (tk.TclError, TypeError, ValueError):
+            pass
+
+    def open_mod_details_modal(self, mod_index: int) -> None:
+        if not (0 <= mod_index < len(self.mods)):
+            return
+
+        self.close_mod_details_modal()
+        mod = self.mods[mod_index]
+        self.show_modal_technical_var.set(False)
+
+        # Modal behavior stays UI-only: one borderless CTkToplevel, centered over
+        # the app, grabs focus, and never touches worker-thread state directly.
+        modal = ctk.CTkToplevel(self)
+        self.mod_details_modal = modal
+        self.mod_details_icon_image = None
+        modal.withdraw()
+        modal.transient(self)
+        modal.resizable(False, False)
+        modal.overrideredirect(True)
+        modal.attributes("-topmost", True)
+        modal.bind("<Escape>", lambda _event: self.close_mod_details_modal())
+
+        shell = ctk.CTkFrame(modal, corner_radius=24, fg_color=COLORS["surface"], border_width=1, border_color=COLORS["border_hot"])
+        shell.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        shell.grid_columnconfigure(1, weight=1)
+
+        close_button = ctk.CTkButton(shell, text="X", width=32, height=28, command=self.close_mod_details_modal)
+        close_button.grid(row=0, column=2, sticky="ne", padx=14, pady=12)
+        style_muted_button(close_button)
+
+        self._render_mod_icon(shell, mod)
+
+        title_block = ctk.CTkFrame(shell, fg_color="transparent")
+        title_block.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(18, 8))
+        title_block.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            title_block,
+            text=mod["name"],
+            anchor="w",
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(size=24, weight="bold"),
+            wraplength=330,
+        ).grid(row=0, column=0, sticky="ew")
+
+        badge_text = self._simple_status_label(mod_index, mod)
+        create_status_badge(title_block, badge_text, width=156).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        summary = ctk.CTkFrame(shell, corner_radius=18, fg_color=COLORS["card"], border_width=1, border_color=COLORS["border"])
+        summary.grid(row=1, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 12))
+        summary.grid_columnconfigure(1, weight=1)
+
+        summary_rows = self._modal_summary_rows(mod_index, mod)
+        for row, (label, value, color) in enumerate(summary_rows):
+            ctk.CTkLabel(summary, text=label, anchor="w", text_color=COLORS["muted"], font=ctk.CTkFont(size=12, weight="bold")).grid(
+                row=row,
+                column=0,
+                sticky="w",
+                padx=(12, 10),
+                pady=(8 if row == 0 else 3, 8 if row == len(summary_rows) - 1 else 3),
             )
-            delete_button.grid(row=0, column=4, rowspan=2, padx=12, pady=10)
+            ctk.CTkLabel(summary, text=value, anchor="w", text_color=color, font=ctk.CTkFont(size=13), wraplength=380).grid(
+                row=row,
+                column=1,
+                sticky="ew",
+                padx=(0, 12),
+                pady=(8 if row == 0 else 3, 8 if row == len(summary_rows) - 1 else 3),
+            )
 
-        self.count_label.configure(text=f"{len(self.mods)} mod{'s' if len(self.mods) != 1 else ''} loaded")
+        technical_toggle = ctk.CTkCheckBox(shell, text="Technical details", variable=self.show_modal_technical_var)
+        technical_toggle.grid(row=2, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 8))
+        technical_toggle.configure(
+            text_color=COLORS["muted"],
+            fg_color=COLORS["secondary"],
+            hover_color=COLORS["secondary_hover"],
+            border_color=COLORS["border"],
+            checkbox_width=18,
+            checkbox_height=18,
+        )
+
+        details = ctk.CTkFrame(shell, corner_radius=18, fg_color=COLORS["surface_2"], border_width=1, border_color=COLORS["border"])
+        details.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            details,
+            text=self._modal_details_text(mod_index, mod),
+            justify="left",
+            anchor="w",
+            text_color=COLORS["muted"],
+            wraplength=500,
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=10)
+
+        def toggle_technical_details() -> None:
+            if self.show_modal_technical_var.get():
+                details.grid(row=3, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 12))
+            else:
+                details.grid_remove()
+            modal.update_idletasks()
+            self._center_modal(modal)
+
+        technical_toggle.configure(command=toggle_technical_details)
+        details.grid_remove()
+
+        actions = ctk.CTkFrame(shell, fg_color="transparent")
+        actions.grid(row=4, column=0, columnspan=3, sticky="ew", padx=18, pady=(0, 18))
+        actions.grid_columnconfigure(3, weight=1)
+        self._render_modal_actions(actions, mod_index)
+
+        modal.update_idletasks()
+        self._center_modal(modal)
+        modal.deiconify()
+        modal.lift(self)
+        modal.focus_force()
+        modal.grab_set()
+
+    def _render_mod_icon(self, parent: Any, mod: dict) -> None:
+        icon_path = str(mod.get("icon_path") or mod.get("cached_icon") or mod.get("cached_icon_path") or mod.get("icon") or "").strip()
+        icon_frame = ctk.CTkFrame(
+            parent,
+            width=118,
+            height=118,
+            corner_radius=24,
+            fg_color=COLORS["card"],
+            border_width=1,
+            border_color=COLORS["primary"],
+        )
+        icon_frame.grid(row=0, column=0, sticky="nw", padx=18, pady=18)
+        icon_frame.grid_propagate(False)
+
+        if icon_path and Path(icon_path).exists():
+            try:
+                image = tk.PhotoImage(file=icon_path)
+                shrink_by = max(image.width() // 96, image.height() // 96, 1)
+                self.mod_details_icon_image = image.subsample(shrink_by, shrink_by) if shrink_by > 1 else image
+                ctk.CTkLabel(icon_frame, text="", image=self.mod_details_icon_image).place(relx=0.5, rely=0.5, anchor="center")
+                return
+            except tk.TclError:
+                self.mod_details_icon_image = None
+
+        initial = str(mod.get("name", "?")).strip()[:1].upper() or "?"
+        ctk.CTkLabel(icon_frame, text=initial, font=ctk.CTkFont(size=46, weight="bold"), text_color=COLORS["primary"]).place(
+            relx=0.5,
+            rely=0.5,
+            anchor="center",
+        )
+
+    def _modal_summary_rows(self, mod_index: int, mod: dict) -> List[Tuple[str, str, str]]:
+        missing = self._missing_dependency_details_for_mod(mod_index, mod)
+        dependency_text = f"{len(missing)} missing" if missing else "Looks okay"
+        dependency_color = COLORS["warning"] if missing else COLORS["muted"]
+        installed_files = self._installed_files_for_mod(mod)
+        file_summary = f"{len(installed_files)} tracked" if installed_files else "None tracked"
+        return [
+            ("State", "Enabled" if mod.get("enabled", True) else "Disabled", COLORS["text"]),
+            ("Author", str(mod.get("author") or "Unknown"), COLORS["text"]),
+            ("Package", str(mod.get("package") or mod.get("package_id") or "Unknown"), COLORS["text"]),
+            ("Version", str(mod.get("installed_version") or mod.get("latest_version") or "Unknown"), COLORS["text"]),
+            ("Update", str(mod.get("update_status") or "Not checked"), COLORS["text"]),
+            ("Dependencies", dependency_text, dependency_color),
+            ("Installed files", file_summary, COLORS["text"]),
+        ]
+
+    def _modal_details_text(self, mod_index: int, mod: dict) -> str:
+        installed_files = self._installed_files_for_mod(mod)
+        missing = self._missing_dependency_details_for_mod(mod_index, mod)
+        latest_error = self._latest_failure_for_mod(mod)
+        source_url = str(mod.get("source_url") or mod.get("url") or "Not known")
+        resolved_url = str(mod.get("url") or "Not known")
+        latest_download_url = str(mod.get("latest_download_url") or "")
+        if latest_download_url:
+            resolved_url = latest_download_url
+
+        lines = [
+            "Full installed file paths: " + (", ".join(installed_files) if installed_files else "None tracked"),
+            "Missing dependencies: " + ("; ".join(missing) if missing else "None known"),
+            "Raw dependency IDs: " + (", ".join(self._known_dependency_refs_for_mod(mod)) or "None known"),
+            "Latest failure: " + (latest_error or "None"),
+            "Source URL: " + source_url,
+            "Resolved URL: " + resolved_url,
+            "Internal status: " + str(mod.get("status", "Ready")),
+        ]
+        return "\n".join(lines)
+
+    def _render_modal_actions(self, parent: Any, mod_index: int) -> None:
+        mod = self.mods[mod_index]
+        installed = self._is_mod_installed(mod_index, mod)
+        disabled = not mod.get("enabled", True)
+        column = 0
+
+        if disabled:
+            button = ctk.CTkButton(parent, text="Enable", command=lambda idx=mod_index: self._modal_enable_mod(idx))
+            button.grid(
+                row=0,
+                column=column,
+                padx=(0, 8),
+            )
+            style_primary_button(button)
+            if self.selected_bepinex_path is None:
+                button.configure(state="disabled")
+            column += 1
+        elif installed:
+            button = ctk.CTkButton(parent, text="Repair", command=lambda idx=mod_index: self._modal_repair_mod(idx))
+            button.grid(
+                row=0,
+                column=column,
+                padx=(0, 8),
+            )
+            style_primary_button(button)
+            if self.selected_bepinex_path is None:
+                button.configure(state="disabled")
+            column += 1
+            button = ctk.CTkButton(
+                parent,
+                text="Uninstall",
+                command=lambda idx=mod_index: self._modal_uninstall_mod(idx),
+            )
+            button.grid(row=0, column=column, padx=(0, 8))
+            style_danger_button(button)
+            if self.selected_bepinex_path is None:
+                button.configure(state="disabled")
+            column += 1
+        else:
+            button = ctk.CTkButton(parent, text="Install", command=lambda idx=mod_index: self._modal_install_mod(idx))
+            button.grid(
+                row=0,
+                column=column,
+                padx=(0, 8),
+            )
+            style_primary_button(button)
+            if self.selected_bepinex_path is None:
+                button.configure(state="disabled")
+            column += 1
+
+        close_button = ctk.CTkButton(parent, text="Close", command=self.close_mod_details_modal)
+        close_button.grid(row=0, column=4, sticky="e")
+        style_muted_button(close_button)
+
+    def _center_modal(self, modal: ctk.CTkToplevel) -> None:
+        self.update_idletasks()
+        main_x = self.winfo_rootx()
+        main_y = self.winfo_rooty()
+        main_width = self.winfo_width()
+        main_height = self.winfo_height()
+        modal_width = modal.winfo_reqwidth()
+        modal_height = modal.winfo_reqheight()
+        x = main_x + max((main_width - modal_width) // 2, 0)
+        y = main_y + max((main_height - modal_height) // 2, 0)
+        modal.geometry(f"+{x}+{y}")
+
+    def close_mod_details_modal(self) -> None:
+        if self.mod_details_modal is None:
+            return
+        try:
+            self.mod_details_modal.grab_release()
+        except tk.TclError:
+            pass
+        self.mod_details_modal.destroy()
+        self.mod_details_modal = None
+        self.mod_details_icon_image = None
+
+    def _modal_install_mod(self, mod_index: int) -> None:
+        self.close_mod_details_modal()
+        self.install_missing_mods([mod_index])
+
+    def _modal_repair_mod(self, mod_index: int) -> None:
+        self.close_mod_details_modal()
+        self._queue_log(f"Repair requested for {self.mods[mod_index]['name']}")
+        self.install_missing_mods([mod_index], force_overwrite=True)
+
+    def _modal_uninstall_mod(self, mod_index: int) -> None:
+        self.close_mod_details_modal()
+        self.uninstall_mods([mod_index])
+
+    def _modal_enable_mod(self, mod_index: int) -> None:
+        self.close_mod_details_modal()
+        self.set_mod_enabled(mod_index, True)
+
+    def _card_actions_for_column(self, column_name: str, mod_index: int) -> List[Tuple[str, Any]]:
+        mod = self.mods[mod_index]
+        if not mod.get("enabled", True):
+            return [("Enable", lambda idx=mod_index: self.set_mod_enabled(idx, True))]
+        if column_name == "To Install":
+            return [("Install", lambda idx=mod_index: self.install_missing_mods([idx]))]
+        if column_name == "Installed":
+            return [("Repair", lambda idx=mod_index: self.install_missing_mods([idx], force_overwrite=True))]
+        if str(mod.get("update_status", "")) == "Update available":
+            return [("Update", lambda idx=mod_index: self.install_missing_mods([idx], force_overwrite=True))]
+        return [("Open", lambda idx=mod_index: self.open_mod_details_modal(idx))]
+
+    def _kanban_column_for_mod(self, index: int, mod: dict) -> str:
+        if not mod.get("enabled", True):
+            return "Disabled"
+        if str(mod.get("status", "")) == "Failed":
+            return "Needs Attention"
+        if self._missing_dependency_details_for_mod(index, mod):
+            return "Needs Attention"
+        if str(mod.get("update_status", "")) == "Update available":
+            return "Needs Attention"
+        if self._is_mod_installed(index, mod):
+            return "Installed"
+        return "To Install"
+
+    def _simple_status_label(self, index: int, mod: dict) -> str:
+        if not mod.get("enabled", True):
+            return "Disabled"
+        if str(mod.get("status", "")) == "Failed":
+            return "Failed"
+        if self._missing_dependency_details_for_mod(index, mod):
+            return "Missing dependencies"
+        if str(mod.get("update_status", "")) == "Update available":
+            return "Update available"
+        if self._is_mod_installed(index, mod):
+            return "Installed"
+        return "Missing"
+
+    def _set_mod_filter(self, selected_filter: str) -> None:
+        self.mod_filter_var.set(selected_filter)
+        self._render_mods()
+
+    def toggle_mod_details(self, index: int) -> None:
+        if index in self.expanded_mods:
+            self.expanded_mods.remove(index)
+        else:
+            self.expanded_mods.add(index)
+        self._render_mods()
+
+    def _mod_matches_current_view(self, index: int, mod: dict) -> bool:
+        search_text = self.mod_search_var.get().strip().lower()
+        if search_text:
+            haystack = " ".join(
+                str(mod.get(field, ""))
+                for field in (
+                    "name",
+                    "url",
+                    "source_url",
+                    "author",
+                    "package",
+                    "package_id",
+                    "status",
+                    "update_status",
+                    "installed_version",
+                    "latest_version",
+                )
+            ).lower()
+            if search_text not in haystack:
+                return False
+
+        current_filter = self.mod_filter_var.get()
+        status = str(mod.get("status", "Ready"))
+        if current_filter == "Enabled":
+            return bool(mod.get("enabled", True))
+        if current_filter == "Disabled":
+            return not bool(mod.get("enabled", True))
+        if current_filter == "Installed":
+            return status == "Installed"
+        if current_filter == "Failed":
+            return status == "Failed"
+        if current_filter == "Updates":
+            return str(mod.get("update_status", "")) == "Update available"
+        if current_filter == "Missing deps":
+            return bool(self._missing_dependency_details_for_mod(index, mod))
+        return True
+
+    def _mod_subtitle(self, mod: dict) -> str:
+        source = str(mod.get("source_url") or mod.get("url") or "")
+        update_status = str(mod.get("update_status", "")).strip()
+        latest_version = str(mod.get("latest_version", "")).strip()
+        if update_status == "Unknown version" and latest_version:
+            return f"{source}  |  Latest: {latest_version}"
+        if update_status:
+            return f"{source}  |  {update_status}"
+        return source
+
+    def _card_badge_text(self, index: int, mod: dict) -> str:
+        if self._missing_dependency_details_for_mod(index, mod):
+            return "Missing dependencies"
+        if str(mod.get("update_status", "")) == "Update available":
+            return "Update available"
+        return str(mod.get("status", "Ready") or "Ready")
+
+    def _mod_detail_lines(self, index: int, mod: dict) -> List[str]:
+        source_url = str(mod.get("source_url") or mod.get("url") or "Not known")
+        resolved_url = str(mod.get("url") or "Not known")
+        latest_download_url = str(mod.get("latest_download_url") or "")
+        if latest_download_url and latest_download_url != resolved_url:
+            resolved_url = latest_download_url
+
+        lines = [
+            f"Source URL: {source_url}",
+            f"Resolved download URL: {resolved_url}",
+            f"Author: {mod.get('author') or 'Unknown'}",
+            f"Package: {mod.get('package') or mod.get('package_id') or 'Unknown'}",
+            f"Installed version: {mod.get('installed_version') or 'Unknown'}",
+            f"Latest version: {mod.get('latest_version') or 'Unknown'}",
+            f"Update status: {mod.get('update_status') or 'Not checked'}",
+        ]
+
+        installed_files = self._installed_files_for_mod(mod)
+        lines.append("Installed files: " + (", ".join(installed_files[:8]) if installed_files else "None tracked"))
+        if len(installed_files) > 8:
+            lines.append(f"Installed files continued: {len(installed_files) - 8} more tracked")
+
+        missing = self._missing_dependency_details_for_mod(index, mod)
+        if missing:
+            lines.append("Missing dependencies: " + "; ".join(missing))
+        else:
+            lines.append("Missing dependencies: None known")
+
+        dependency_refs = self._known_dependency_refs_for_mod(mod)
+        lines.append("Dependencies: " + (", ".join(dependency_refs) if dependency_refs else "None known"))
+        related_logs = self._related_logs_for_mod(mod)
+        lines.append("Logs: " + (" | ".join(related_logs) if related_logs else "None yet"))
+        return lines
+
+    def _installed_files_for_mod(self, mod: dict) -> List[str]:
+        if self.selected_bepinex_path is None:
+            return [record.relative_path for record in self._installed_records_for_mod(mod)]
+
+        history = load_install_history(self.selected_bepinex_path)
+        installed_mods = history.get("mods", {})
+        if not isinstance(installed_mods, dict):
+            return [record.relative_path for record in self._installed_records_for_mod(mod)]
+
+        history_entry = installed_mods.get(mod.get("name", ""))
+        if not isinstance(history_entry, dict):
+            source_url = str(mod.get("source_url") or mod.get("url") or "")
+            for candidate in installed_mods.values():
+                if isinstance(candidate, dict) and candidate.get("source_url") == source_url:
+                    history_entry = candidate
+                    break
+
+        files = history_entry.get("files", []) if isinstance(history_entry, dict) else []
+        tracked_files = [str(path) for path in files if path]
+        if tracked_files:
+            return tracked_files
+        return [record.relative_path for record in self._installed_records_for_mod(mod)]
+
+    def _missing_dependency_details_for_mod(self, index: int, mod: dict) -> List[str]:
+        names = {str(mod.get("name", "")).lower()}
+        package = str(mod.get("package") or mod.get("package_id") or "").lower()
+        if package:
+            names.add(package)
+
+        details = []
+        for dependency in self.missing_dependencies:
+            required_by = str(dependency.get("required_by", "")).lower()
+            if required_by not in names:
+                continue
+            display_name = dependency.get("display_name", "Unknown dependency")
+            url = dependency.get("url", "")
+            details.append(f"{display_name} ({url})" if url else str(display_name))
+        return details
+
+    def _known_dependency_refs_for_mod(self, mod: dict) -> List[str]:
+        refs = []
+        dependency_guid = str(mod.get("dependency_guid", "")).strip()
+        if dependency_guid:
+            refs.append(dependency_guid)
+        package_id = str(mod.get("package_id", "")).strip()
+        if package_id:
+            refs.append(package_id)
+        return refs
+
+    def _is_mod_installed(self, index: int, mod: dict) -> bool:
+        return bool(self._installed_records_for_mod(mod))
+
+    def _installed_records_for_mod(self, mod: dict) -> List[InstalledPluginRecord]:
+        name_key = loose_match_key(str(mod.get("name", "")))
+        source_url = str(mod.get("source_url") or mod.get("url") or "").lower()
+        package = str(mod.get("package") or mod.get("package_id") or mod.get("name") or "")
+        package_key = loose_match_key(package)
+        records: List[InstalledPluginRecord] = []
+
+        records.extend(self.installed_plugin_index.by_mod_name.get(name_key, []))
+        if source_url:
+            records.extend(self.installed_plugin_index.by_source_url.get(source_url, []))
+        if package_key:
+            candidate = self.installed_plugin_index.by_loose_name.get(package_key)
+            if candidate:
+                records.append(candidate)
+
+        for token in {name_key, package_key}:
+            if not token:
+                continue
+            for dll_key, record in self.installed_plugin_index.by_loose_name.items():
+                if token == dll_key or token in dll_key or dll_key in token:
+                    records.append(record)
+
+        deduped = {}
+        for record in records:
+            deduped[record.relative_path] = record
+        return list(deduped.values())
+
+    def _refresh_installed_state_from_scan(self) -> None:
+        for index, mod in enumerate(self.mods):
+            if not mod.get("enabled", True):
+                mod["status"] = "Disabled"
+            elif self._is_mod_installed(index, mod) and str(mod.get("status", "")) != "Failed":
+                mod["status"] = "Installed"
+            elif str(mod.get("status", "")) in {"Installed", "Uninstalled"}:
+                mod["status"] = "Ready"
+
+    def _related_logs_for_mod(self, mod: dict) -> List[str]:
+        name = str(mod.get("name", "")).lower()
+        if not name:
+            return []
+        return [line for line in self.recent_logs[-80:] if name in line.lower()][-6:]
+
+    def _latest_failure_for_mod(self, mod: dict) -> str:
+        name = str(mod.get("name", "")).lower()
+        if not name:
+            return ""
+        for line in reversed(self.recent_logs):
+            lower_line = line.lower()
+            if name in lower_line and ("fail" in lower_line or "error" in lower_line):
+                return line
+        return ""
 
     def _status_color(self, status: str) -> str:
         colors = {
-            "Ready": "#d1d5db",
-            "Downloading": "#60a5fa",
-            "Downloaded": "#93c5fd",
-            "Extracting": "#facc15",
-            "Installing": "#fb923c",
-            "Installed": "#4ade80",
-            "Uninstalling": "#fb923c",
-            "Uninstalled": "#4ade80",
-            "Failed": "#f87171",
-            "Disabled": "#6b7280",
+            "Ready": COLORS["text"],
+            "Downloading": COLORS["primary"],
+            "Downloaded": COLORS["primary"],
+            "Extracting": COLORS["warning"],
+            "Installing": COLORS["warning"],
+            "Installed": COLORS["success"],
+            "Uninstalling": COLORS["warning"],
+            "Uninstalled": COLORS["success"],
+            "Failed": COLORS["danger"],
+            "Disabled": COLORS["muted_2"],
+            "Update available": COLORS["warning"],
+            "Missing dependencies": COLORS["pink"],
         }
-        return colors.get(status, "#d1d5db")
+        return colors.get(status, COLORS["text"])
 
     def _update_status_color(self, status: str) -> str:
         colors = {
-            "Up to date": "#4ade80",
-            "Update available": "#facc15",
-            "Unknown version": "#93c5fd",
-            "Unknown source": "#f87171",
+            "Up to date": COLORS["success"],
+            "Update available": COLORS["warning"],
+            "Unknown version": COLORS["primary"],
+            "Unknown source": COLORS["danger"],
+            "Missing dependencies": COLORS["pink"],
         }
-        return colors.get(status, "#9ca3af")
+        return colors.get(status, COLORS["muted"])
 
     def _set_busy(self, busy: bool) -> None:
         self.is_busy = busy
@@ -308,15 +1282,41 @@ class ValheimModDownloader(ctk.CTk):
             self.import_button,
             self.main_action_button,
             self.uninstall_button,
+            self.run_mode_button,
             self.add_dependencies_button,
             self.check_updates_button,
             self.select_bepinex_button,
+            self.open_bepinex_button,
+            self.check_installed_button,
             self.install_mode_selector,
+            self.overwrite_checkbox,
+            self.advanced_checkbox,
         ):
             if button is self.add_dependencies_button and not busy:
                 button.configure(state="normal" if self.missing_dependencies else "disabled")
+            elif button is self.open_bepinex_button and not busy:
+                button.configure(state="normal" if self.selected_bepinex_path is not None else "disabled")
             else:
                 button.configure(state=state)
+        if not busy:
+            self._refresh_action_availability()
+
+    def _refresh_action_availability(self) -> None:
+        has_bepinex = self.selected_bepinex_path is not None
+        install_state = "normal" if has_bepinex and self.mods and not self.is_busy else "disabled"
+        scan_state = "normal" if has_bepinex and not self.is_busy else "disabled"
+        self.main_action_button.configure(state=install_state)
+        self.check_installed_button.configure(state=scan_state)
+        self.open_bepinex_button.configure(state=scan_state)
+        if has_bepinex:
+            if self.mods:
+                self.next_step_label.configure(text="Load a pack, scan installed mods, then install what is missing.", text_color=COLORS["muted"])
+            else:
+                self.next_step_label.configure(text="BepInEx is ready. Load a pack to see what to install.", text_color=COLORS["muted"])
+            style_secondary_button(self.select_bepinex_button)
+        else:
+            self.next_step_label.configure(text="Select your BepInEx folder to scan and install mods.", text_color=COLORS["warning"])
+            style_primary_button(self.select_bepinex_button)
 
     def on_install_mode_changed(self, selected_label: str) -> None:
         label_to_mode = {
@@ -324,15 +1324,90 @@ class ValheimModDownloader(ctk.CTk):
             "Download + Gather DLLs": "gather_dlls",
             "Full BepInEx Install": "full_install",
         }
-        mode_to_button_text = {
-            "download_only": "Download Mods",
-            "gather_dlls": "Download and Gather DLLs",
-            "full_install": "Download and Install to BepInEx",
-        }
 
         mode = label_to_mode[selected_label]
         self.install_mode_var.set(mode)
-        self.main_action_button.configure(text=mode_to_button_text[mode])
+
+    def set_mod_enabled(self, index: int, enabled: bool) -> None:
+        if self.is_busy or not (0 <= index < len(self.mods)):
+            return
+        self.mods[index]["enabled"] = enabled
+        self.mods[index]["status"] = "Ready" if enabled else "Disabled"
+        self._render_mods()
+        self._queue_log(f"{'Enabled' if enabled else 'Disabled'} {self.mods[index]['name']}")
+
+    def install_missing_mods(self, selected_indices: Optional[List[int]] = None, force_overwrite: bool = False) -> None:
+        if self.is_busy:
+            return
+        if self.selected_bepinex_path is None:
+            messagebox.showerror("BepInEx Folder Required", "Select a valid BepInEx folder before installing mods.")
+            return
+        if not self.mods:
+            messagebox.showinfo("No Mods", "Import or add a modpack first.")
+            return
+
+        self.check_installed_mods(show_message=False)
+        overwrite = force_overwrite or self.overwrite_installed_var.get()
+        target_indices = set(selected_indices if selected_indices is not None else range(len(self.mods)))
+        install_indices = []
+        skipped_installed = 0
+
+        # Default safe path: install only missing enabled mods. Installed mods are
+        # skipped unless the user explicitly opts into overwrite/update.
+        for index, mod in enumerate(self.mods):
+            if index not in target_indices or not mod.get("enabled", True):
+                continue
+            installed = self._is_mod_installed(index, mod)
+            update_available = str(mod.get("update_status", "")) == "Update available"
+            if installed and not overwrite and not (force_overwrite and update_available):
+                skipped_installed += 1
+                mod["status"] = "Installed"
+                self._queue_log(f"Skipping {mod['name']} because it is already installed.")
+                continue
+            if selected_indices is None and installed and not overwrite:
+                continue
+            install_indices.append(index)
+
+        if not install_indices:
+            self._render_mods()
+            messagebox.showinfo("Nothing To Install", f"All selected mods are already installed. Skipped: {skipped_installed}.")
+            return
+
+        target_dir = self.selected_bepinex_path / "_mod_installer_downloads"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        mods_snapshot = []
+        for index, mod in enumerate(self.mods):
+            mod_copy = mod.copy()
+            mod_copy["enabled"] = index in install_indices
+            mods_snapshot.append(mod_copy)
+            if index in install_indices:
+                self.mods[index]["status"] = "Ready"
+
+        self.pending_skipped_installed = skipped_installed
+        self._set_busy(True)
+        self.progress.set(0)
+        self.status_var.set("Installing missing mods...")
+        self._render_mods()
+        self._queue_log(f"Installing {len(install_indices)} mod(s); skipped already installed {skipped_installed}")
+
+        worker = threading.Thread(
+            target=self._download_worker,
+            args=(mods_snapshot, target_dir, "full_install", self.selected_bepinex_path),
+            daemon=True,
+        )
+        worker.start()
+
+    def uninstall_mods(self, selected_indices: List[int]) -> None:
+        if self.is_busy:
+            return
+        bepinex_dir = self.selected_bepinex_path
+        if bepinex_dir is None:
+            messagebox.showerror("BepInEx Folder Required", "Select a valid BepInEx folder before uninstalling mods.")
+            return
+        selected_mods = [(index, self.mods[index].copy()) for index in selected_indices if 0 <= index < len(self.mods)]
+        if not selected_mods:
+            return
+        self._start_uninstall_worker(selected_mods, bepinex_dir)
 
     def select_bepinex_folder(self) -> None:
         if self.is_busy:
@@ -342,20 +1417,63 @@ class ValheimModDownloader(ctk.CTk):
         if not selected_target:
             return
 
-        try:
-            bepinex_dir = self._resolve_bepinex_folder(Path(selected_target))
-        except ValueError as exc:
+        selected_path = Path(selected_target)
+        self._queue_log(f"Selected folder: {selected_path}")
+        bepinex_dir = normalize_bepinex_selection(selected_path)
+        if bepinex_dir is None or not validate_bepinex_path(bepinex_dir):
             self.selected_bepinex_path = None
-            self.bepinex_path_label.configure(text_color="#f87171")
-            self.bepinex_path_var.set(f"Invalid BepInEx folder: {selected_target}")
-            self._queue_log(f"Invalid BepInEx selection: {exc}")
-            messagebox.showerror("Invalid BepInEx Folder", str(exc))
+            self.installed_plugin_index = InstalledPluginIndex()
+            self.bepinex_path_label.configure(text_color=COLORS["danger"])
+            self.bepinex_validation_var.set("Invalid")
+            self.bepinex_validation_label.configure(fg_color="#3B1424", text_color="#FDA4AF", border_width=1, border_color=COLORS["danger"])
+            self.open_bepinex_button.configure(state="disabled")
+            self.bepinex_path_var.set("No folder selected")
+            self._refresh_action_availability()
+            self._queue_log("BepInEx validation failed")
+            messagebox.showerror(
+                "BepInEx Not Found",
+                "Could not find BepInEx. Select either your Valheim folder or your Valheim/BepInEx folder.",
+            )
             return
 
         self.selected_bepinex_path = bepinex_dir
-        self.bepinex_path_label.configure(text_color="#4ade80")
-        self.bepinex_path_var.set(f"Valid BepInEx folder: {bepinex_dir}")
-        self._queue_log(f"Selected valid BepInEx folder: {bepinex_dir}")
+        self.bepinex_path_label.configure(text_color=COLORS["success"])
+        self.bepinex_validation_var.set("Valid")
+        self.bepinex_validation_label.configure(fg_color="#052E16", text_color=COLORS["success"], border_width=1, border_color=COLORS["success"])
+        self.open_bepinex_button.configure(state="normal")
+        self.bepinex_path_var.set(f"BepInEx detected: {bepinex_dir}")
+        self._queue_log(f"Detected BepInEx folder: {bepinex_dir}")
+        self._queue_log("BepInEx validation passed")
+        self._refresh_action_availability()
+        # Simplified flow: choosing BepInEx immediately scans installed plugins so
+        # the board can show what is missing without asking the user to think about it.
+        self.check_installed_mods(show_message=False)
+
+    def open_bepinex_folder(self) -> None:
+        if self.selected_bepinex_path is None:
+            messagebox.showinfo("No Folder Selected", "Select a BepInEx folder first.")
+            return
+        os.startfile(str(self.selected_bepinex_path))
+
+    def check_installed_mods(self, show_message: bool = True) -> None:
+        if self.selected_bepinex_path is None:
+            if show_message:
+                messagebox.showinfo("No Folder Selected", "Select a BepInEx folder first.")
+            return
+        self.installed_plugin_index = scan_installed_plugins(self.selected_bepinex_path)
+        self._refresh_installed_state_from_scan()
+        self._render_mods()
+        self.status_var.set(f"Scanned {len(self.installed_plugin_index.records)} installed plugin DLLs")
+        self._refresh_action_availability()
+        self._queue_log(f"Scanned installed plugins: {len(self.installed_plugin_index.records)} DLLs indexed")
+        if show_message:
+            messagebox.showinfo("Installed Mods Checked", f"Found {len(self.installed_plugin_index.records)} plugin DLLs.")
+
+    def _toggle_advanced_actions(self) -> None:
+        if self.show_advanced_var.get():
+            self.advanced_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        else:
+            self.advanced_frame.grid_remove()
 
     def _queue_log(self, message: str) -> None:
         self.ui_queue.put(("log", message))
@@ -448,6 +1566,11 @@ class ValheimModDownloader(ctk.CTk):
         if self.is_busy:
             return
         del self.mods[index]
+        self.expanded_mods = {
+            expanded_index if expanded_index < index else expanded_index - 1
+            for expanded_index in self.expanded_mods
+            if expanded_index != index
+        }
         self._render_mods()
 
     def toggle_mod_enabled(self, index: int) -> None:
@@ -455,10 +1578,7 @@ class ValheimModDownloader(ctk.CTk):
             return
 
         enabled = not self.mods[index].get("enabled", True)
-        self.mods[index]["enabled"] = enabled
-        self.mods[index]["status"] = "Ready" if enabled else "Disabled"
-        self._render_mods()
-        self._queue_log(f"{'Enabled' if enabled else 'Disabled'} {self.mods[index]['name']}")
+        self.set_mod_enabled(index, enabled)
 
     def add_mod(self) -> None:
         if self.is_busy:
@@ -553,7 +1673,16 @@ class ValheimModDownloader(ctk.CTk):
             return
 
         self.mods = imported
+        self.expanded_mods.clear()
+        self.mod_search_var.set("")
+        self.mod_filter_var.set("All")
+        if hasattr(self, "mod_filter_selector"):
+            self.mod_filter_selector.set("All")
+        if self.selected_bepinex_path is not None:
+            self.installed_plugin_index = scan_installed_plugins(self.selected_bepinex_path)
+            self._refresh_installed_state_from_scan()
         self._render_mods()
+        self._refresh_action_availability()
         self.progress.set(0)
         self.status_var.set(f"Imported {len(self.mods)} mods from {Path(path).name}")
         self._queue_log(f"Imported {len(self.mods)} mods from {path}")
@@ -597,7 +1726,28 @@ class ValheimModDownloader(ctk.CTk):
             mod["status"] = "Ready" if mod.get("enabled", True) else "Disabled"
         self._render_mods()
         self._queue_log(f"Starting {mode_labels.get(mode, mode)}")
-        mods_snapshot = [mod.copy() for mod in self.mods]
+        skipped_installed = 0
+        if mode == "full_install" and bepinex_dir is not None and not self.overwrite_installed_var.get():
+            self.check_installed_mods(show_message=False)
+        mods_snapshot = []
+        for index, mod in enumerate(self.mods):
+            mod_copy = mod.copy()
+            if (
+                mode == "full_install"
+                and bepinex_dir is not None
+                and not self.overwrite_installed_var.get()
+                and self._is_mod_installed(index, mod)
+            ):
+                mod_copy["enabled"] = False
+                skipped_installed += 1
+                self._queue_log(f"Skipping {mod['name']} because it is already installed.")
+            mods_snapshot.append(mod_copy)
+        if mode == "full_install" and not any(mod.get("enabled", True) for mod in mods_snapshot):
+            self.status_var.set("Nothing to install; selected mods are already installed.")
+            self._set_busy(False)
+            self._render_mods()
+            return
+        self.pending_skipped_installed = skipped_installed
 
         worker = threading.Thread(
             target=self._download_worker,
@@ -622,6 +1772,9 @@ class ValheimModDownloader(ctk.CTk):
             self._queue_log("Uninstall blocked because no enabled mods are selected")
             return
 
+        self._start_uninstall_worker(selected_mods, bepinex_dir)
+
+    def _start_uninstall_worker(self, selected_mods: List[Tuple[int, dict]], bepinex_dir: Path) -> None:
         self._set_busy(True)
         self.progress.set(0)
         self.status_var.set("Starting uninstall...")
@@ -859,25 +2012,15 @@ class ValheimModDownloader(ctk.CTk):
 
     def _resolve_bepinex_folder(self, selected_path: Path) -> Path:
         """Accept either a Valheim folder containing BepInEx or the BepInEx folder itself."""
-        selected_path = selected_path.resolve()
-        standard_children = ("plugins", "config", "patchers")
-
-        if selected_path.name.lower() == "bepinex" or any((selected_path / child).exists() for child in standard_children):
-            bepinex_dir = selected_path
-        else:
-            bepinex_dir = selected_path / "BepInEx"
-
-        if not bepinex_dir.exists():
+        bepinex_dir = normalize_bepinex_selection(selected_path)
+        if bepinex_dir is None or not validate_bepinex_path(bepinex_dir):
             raise ValueError(
-                "Could not find a BepInEx folder. Select your Valheim folder containing BepInEx, "
-                "or select the BepInEx folder directly."
+                "Could not find BepInEx. Select either your Valheim folder or your Valheim/BepInEx folder."
             )
-        if not bepinex_dir.is_dir():
-            raise ValueError("The detected BepInEx path is not a folder.")
 
         # The installer can create these standard BepInEx folders if they are missing,
         # but the parent BepInEx folder must already exist to avoid installing elsewhere.
-        for folder_name in standard_children:
+        for folder_name in ("plugins", "config", "patchers"):
             target = bepinex_dir / folder_name
             if target.exists() and not target.is_dir():
                 raise ValueError(f"BepInEx/{folder_name} exists but is not a folder.")
@@ -1278,12 +2421,23 @@ class ValheimModDownloader(ctk.CTk):
                     _, successes, gathered_dlls, installed_files, backed_up_files, history_path, failures, dependency_warnings = event
                     self._set_busy(False)
                     self.progress.set(1 if successes else 0)
+                    skipped_installed = self.pending_skipped_installed
+                    self.pending_skipped_installed = 0
+                    if self.selected_bepinex_path is not None:
+                        self.installed_plugin_index = scan_installed_plugins(self.selected_bepinex_path)
+                        self._refresh_installed_state_from_scan()
+                    simple_summary = (
+                        f"Installed: {successes}\n"
+                        f"Skipped already installed: {skipped_installed}\n"
+                        f"Failed: {len(failures)}\n"
+                        f"Missing dependencies: {len(dependency_warnings)}"
+                    )
                     self.status_var.set(
-                        f"Finished: {successes} downloaded, {installed_files} installed, "
-                        f"{gathered_dlls} DLLs gathered, {backed_up_files} backed up, {len(failures)} failed"
+                        f"Installed {successes}, skipped {skipped_installed}, "
+                        f"failed {len(failures)}, missing deps {len(dependency_warnings)}"
                     )
                     self._append_log(
-                        f"Finished. Downloaded {successes}, installed {installed_files}, "
+                        f"Finished. Downloaded {successes}, installed {installed_files}, skipped already installed {skipped_installed}, "
                         f"gathered {gathered_dlls} DLLs, backed up {backed_up_files}, "
                         f"failures {len(failures)}, missing dependencies {len(dependency_warnings)}"
                     )
@@ -1306,9 +2460,7 @@ class ValheimModDownloader(ctk.CTk):
                     if failures:
                         messagebox.showwarning(
                             "Downloads Complete With Errors",
-                            f"Downloaded {successes} files. Installed {installed_files} files. "
-                            f"Gathered {gathered_dlls} DLL files into ready_plugins. "
-                            f"Backed up {backed_up_files} files.\n\n"
+                            simple_summary + "\n\n"
                             "Some operations failed:\n\n"
                             + "\n".join(failures[:10])
                             + history_text
@@ -1317,25 +2469,26 @@ class ValheimModDownloader(ctk.CTk):
                     elif dependency_warnings:
                         messagebox.showwarning(
                             "Missing Dependencies Detected",
-                            f"Downloaded {successes} files. Installed {installed_files} files. "
-                            f"Gathered {gathered_dlls} DLL files into ready_plugins. "
-                            f"Backed up {backed_up_files} files."
+                            simple_summary
                             + history_text
                             + dependency_text,
                         )
                     else:
                         messagebox.showinfo(
                             "Downloads Complete",
-                            f"Downloaded {successes} files. Installed {installed_files} files. "
-                            f"Gathered {gathered_dlls} DLL files into ready_plugins. "
-                            f"Backed up {backed_up_files} files."
+                            simple_summary
                             + history_text,
                         )
+                    self._render_mods()
 
                 elif event_name == "uninstall_complete":
                     _, processed_mods, backed_up_files, deleted_files, failures, history_path = event
                     self._set_busy(False)
                     self.progress.set(1)
+                    if self.selected_bepinex_path is not None:
+                        self.installed_plugin_index = scan_installed_plugins(self.selected_bepinex_path)
+                        self._refresh_installed_state_from_scan()
+                        self._render_mods()
                     self.status_var.set(
                         f"Uninstall finished: {processed_mods} mods processed, {deleted_files} deleted, "
                         f"{backed_up_files} backed up, {len(failures)} failures"
@@ -1396,6 +2549,8 @@ class ValheimModDownloader(ctk.CTk):
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
+        self.recent_logs.append(f"[{timestamp}] {message}")
+        self.recent_logs = self.recent_logs[-300:]
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"[{timestamp}] {message}\n")
         self.log_box.see("end")
