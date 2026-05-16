@@ -3,9 +3,14 @@ ValheimModInstaller
 
 How to run
 ----------
+Portable zip:
 1. Extract the zip file to a normal folder, such as your Desktop.
 2. Open the extracted folder.
 3. Run ValheimModInstaller.exe.
+
+Installer:
+1. Run ValheimModInstallerSetup.exe.
+2. Open Valheim Mod Installer from the Start Menu or Desktop shortcut.
 
 Installing mods
 ---------------
